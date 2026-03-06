@@ -1,7 +1,8 @@
 {
   "permissions": {
     "allow": [
-      "Bash(git stash push -u -m \"notification fixes\")"
+      "Bash(git stash push -u -m \"notification fixes\")",
+      "Read(//Volumes/Moon/pgme/**)"
     ]
   }
 }

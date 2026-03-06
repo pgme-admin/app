@@ -36,6 +36,7 @@ class _EbookListScreenState extends State<EbookListScreen>
   bool _isLoading = true;
   bool _isLoadingMore = false;
   bool _isPurchasing = false;
+  String? _readingBookId;
   String? _error;
   String _searchQuery = '';
   int _currentPage = 1;
@@ -247,6 +248,8 @@ class _EbookListScreenState extends State<EbookListScreen>
   }
 
   Future<void> _handleRead(BookModel book) async {
+    if (_readingBookId != null) return;
+    setState(() => _readingBookId = book.bookId);
     try {
       final data = await _ebookOrderService.getEbookViewUrl(book.bookId);
       if (mounted) {
@@ -266,6 +269,8 @@ class _EbookListScreenState extends State<EbookListScreen>
       if (mounted) {
         _showError('Failed to open eBook: ${e.toString().replaceAll("Exception: ", "")}');
       }
+    } finally {
+      if (mounted) setState(() => _readingBookId = null);
     }
   }
 
@@ -938,10 +943,19 @@ class _EbookListScreenState extends State<EbookListScreen>
                         width: double.infinity,
                         height: isTablet ? 36 : 32,
                         child: ElevatedButton.icon(
-                          onPressed: () => _handleRead(book),
-                          icon: Icon(Icons.menu_book, size: isTablet ? 18 : 14),
+                          onPressed: _readingBookId == book.bookId ? null : () => _handleRead(book),
+                          icon: _readingBookId == book.bookId
+                              ? SizedBox(
+                                  width: isTablet ? 16 : 13,
+                                  height: isTablet ? 16 : 13,
+                                  child: const CircularProgressIndicator(
+                                    strokeWidth: 2,
+                                    color: Colors.white,
+                                  ),
+                                )
+                              : Icon(Icons.menu_book, size: isTablet ? 18 : 14),
                           label: Text(
-                            'Read',
+                            _readingBookId == book.bookId ? 'Opening...' : 'Read',
                             style: TextStyle(
                               fontFamily: 'Poppins',
                               fontWeight: FontWeight.w600,
@@ -951,6 +965,8 @@ class _EbookListScreenState extends State<EbookListScreen>
                           style: ElevatedButton.styleFrom(
                             backgroundColor: purchasedColor,
                             foregroundColor: Colors.white,
+                            disabledBackgroundColor: purchasedColor.withValues(alpha: 0.7),
+                            disabledForegroundColor: Colors.white,
                             shape: RoundedRectangleBorder(
                               borderRadius: BorderRadius.circular(isTablet ? 10 : 8),
                             ),

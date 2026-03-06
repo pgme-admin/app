@@ -69,8 +69,8 @@ class AuthProvider with ChangeNotifier {
         // Get current session ID from storage
         _currentSessionId = await _storageService.getSessionId();
 
-        // Re-register FCM token on app startup
-        PushNotificationService().registerToken();
+        // Re-register FCM token on every app startup (critical for notifications)
+        await PushNotificationService().registerToken();
 
         // Check for multiple active sessions
         try {
@@ -177,8 +177,8 @@ class AuthProvider with ChangeNotifier {
       _onboardingCompleted = authResponse.user.onboardingCompleted;
       _currentSessionId = authResponse.sessionId;
 
-      // Step 5: Register FCM token after successful authentication
-      PushNotificationService().registerToken();
+      // Step 5: Register FCM token after successful authentication (await to ensure delivery)
+      await PushNotificationService().registerToken();
 
       // Step 6: Check for other active sessions (using backend flag)
       _hasMultipleSessions = authResponse.hasOtherActiveSessions;
@@ -325,6 +325,8 @@ class AuthProvider with ChangeNotifier {
                s['is_active'] == true,
       ).toList();
       _hasMultipleSessions = otherSessions.isNotEmpty;
+      // Re-register FCM token so backend associates it with THIS session only
+      await PushNotificationService().registerToken();
       notifyListeners();
     } catch (e) {
       debugPrint('Logout device error: $e');

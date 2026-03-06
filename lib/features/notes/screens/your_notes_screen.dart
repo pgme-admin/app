@@ -689,7 +689,7 @@ class _YourNotesScreenState extends State<YourNotesScreen> {
     final metaIconSize = isTablet ? 20.0 * scale : 16.0;
     final badgeHeight = isTablet ? 26.0 * scale : 20.0;
     final badgeFontSize = isTablet ? 13.0 * scale : 10.0;
-    final bookmarkSize = isTablet ? 30.0 * scale : 24.0;
+    final bookmarkSize = isTablet ? 34.0 * scale : 28.0;
     final cardRadius = isTablet ? 22.0 * scale : 20.0;
 
     return Padding(
@@ -778,31 +778,37 @@ class _YourNotesScreenState extends State<YourNotesScreen> {
                   // Download button
                   const SizedBox(width: 4),
                   GestureDetector(
+                    behavior: HitTestBehavior.opaque,
                     onTap: () {
                       if (!_downloadingDocs.containsKey(item.documentId) &&
                           !_downloadedDocIds.contains(item.documentId)) {
                         _downloadDocument(item);
                       }
                     },
-                    child: _downloadingDocs.containsKey(item.documentId)
-                        ? SizedBox(
-                            width: isTablet ? 22.0 : 20.0,
-                            height: isTablet ? 22.0 : 20.0,
-                            child: CircularProgressIndicator(
-                              value: _downloadingDocs[item.documentId],
-                              strokeWidth: 2,
-                              color: iconColor,
+                    child: Container(
+                      width: isTablet ? 44.0 : 38.0,
+                      height: isTablet ? 44.0 : 38.0,
+                      alignment: Alignment.center,
+                      child: _downloadingDocs.containsKey(item.documentId)
+                          ? SizedBox(
+                              width: isTablet ? 26.0 : 22.0,
+                              height: isTablet ? 26.0 : 22.0,
+                              child: CircularProgressIndicator(
+                                value: _downloadingDocs[item.documentId],
+                                strokeWidth: 2,
+                                color: iconColor,
+                              ),
+                            )
+                          : Icon(
+                              _downloadedDocIds.contains(item.documentId)
+                                  ? Icons.download_done
+                                  : Icons.download_outlined,
+                              size: bookmarkSize,
+                              color: _downloadedDocIds.contains(item.documentId)
+                                  ? AppColors.success
+                                  : secondaryTextColor,
                             ),
-                          )
-                        : Icon(
-                            _downloadedDocIds.contains(item.documentId)
-                                ? Icons.download_done
-                                : Icons.download_outlined,
-                            size: bookmarkSize,
-                            color: _downloadedDocIds.contains(item.documentId)
-                                ? AppColors.success
-                                : secondaryTextColor,
-                          ),
+                    ),
                   ),
                 ],
               ),

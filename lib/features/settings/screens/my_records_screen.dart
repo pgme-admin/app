@@ -1286,30 +1286,34 @@ class _InvoiceDownloadButtonState extends State<_InvoiceDownloadButton> {
   @override
   Widget build(BuildContext context) {
     return GestureDetector(
+      behavior: HitTestBehavior.opaque,
       onTap: _isDownloading ? null : _downloadAndOpenPdf,
-      child: Row(
-        children: [
-          if (_isDownloading)
-            SizedBox(
-              width: widget.isTablet ? 20 : 16,
-              height: widget.isTablet ? 20 : 16,
-              child: CircularProgressIndicator(
-                strokeWidth: 2,
+      child: Padding(
+        padding: EdgeInsets.symmetric(vertical: widget.isTablet ? 6 : 4),
+        child: Row(
+          children: [
+            if (_isDownloading)
+              SizedBox(
+                width: widget.isTablet ? 24 : 20,
+                height: widget.isTablet ? 24 : 20,
+                child: CircularProgressIndicator(
+                  strokeWidth: 2,
+                  color: widget.accentColor,
+                ),
+              )
+            else
+              Icon(Icons.download_outlined, size: widget.isTablet ? 24 : 20, color: widget.accentColor),
+            SizedBox(width: widget.isTablet ? 8 : 6),
+            Text(
+              _isDownloading ? 'Downloading...' : 'Download Invoice',
+              style: TextStyle(
+                fontSize: widget.isTablet ? 16 : 14,
+                fontWeight: FontWeight.w500,
                 color: widget.accentColor,
               ),
-            )
-          else
-            Icon(Icons.download_outlined, size: widget.isTablet ? 20 : 16, color: widget.accentColor),
-          SizedBox(width: widget.isTablet ? 8 : 6),
-          Text(
-            _isDownloading ? 'Downloading...' : 'Download Invoice',
-            style: TextStyle(
-              fontSize: widget.isTablet ? 16 : 13,
-              fontWeight: FontWeight.w500,
-              color: widget.accentColor,
             ),
-          ),
-        ],
+          ],
+        ),
       ),
     );
   }

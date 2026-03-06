@@ -75,7 +75,7 @@ class ResponsiveHelper {
 
   /// Responsive icon size
   static double iconSize(BuildContext context, double baseSize) {
-    return isTablet(context) ? baseSize * 1.2 : baseSize;
+    return isTablet(context) ? baseSize * 1.35 : baseSize;
   }
 
   /// Responsive spacing
