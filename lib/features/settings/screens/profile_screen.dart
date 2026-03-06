@@ -827,16 +827,16 @@ class _ProfileScreenState extends State<ProfileScreen> {
                             child: Row(
                               children: [
                                 Container(
-                                  width: isTablet ? 55 : 44,
-                                  height: isTablet ? 55 : 44,
+                                  width: isTablet ? 62 : 50,
+                                  height: isTablet ? 62 : 50,
                                   decoration: BoxDecoration(
                                     color: isDark ? const Color(0xFF1A4D3D) : const Color(0xFFE0F2F1),
-                                    borderRadius: BorderRadius.circular(isTablet ? 16 : 12),
+                                    borderRadius: BorderRadius.circular(isTablet ? 18 : 14),
                                   ),
                                   child: Center(
                                     child: Icon(
                                       Icons.download_done_rounded,
-                                      size: isTablet ? 27 : 22,
+                                      size: isTablet ? 32 : 26,
                                       color: isDark ? const Color(0xFF80CBC4) : const Color(0xFF00796B),
                                     ),
                                   ),

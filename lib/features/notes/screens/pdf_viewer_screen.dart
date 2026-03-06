@@ -152,18 +152,19 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> {
         return;
       }
 
-      // Check for permanently downloaded file first
+      // Check for permanently downloaded file first (parallel lookup)
       if (widget.documentId != null) {
         final docFileName = 'doc_${widget.documentId}.pdf';
         final ebookFileName = 'ebook_${widget.documentId}.pdf';
-        final downloadedPath =
-            await DownloadService().getDownloadedPath(docFileName) ??
-                await DownloadService().getDownloadedPath(ebookFileName);
+        final downloadService = DownloadService();
+        final results = await Future.wait([
+          downloadService.getDownloadedPath(docFileName),
+          downloadService.getDownloadedPath(ebookFileName),
+        ]);
+        final downloadedPath = results[0] ?? results[1];
         if (downloadedPath != null) {
-          // Verify file is valid (non-empty)
           final file = File(downloadedPath);
-          final fileSize = await file.length();
-          if (fileSize > 0 && mounted) {
+          if (await file.exists() && mounted) {
             setState(() {
               _localPath = downloadedPath;
               _isLoading = false;
@@ -243,10 +244,7 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> {
           await _progressService.getDocumentProgress(widget.documentId!);
       final savedPage = progress['page_number'] as int? ?? 1;
       if (savedPage > 1 && mounted) {
-        await Future.delayed(const Duration(milliseconds: 300));
-        if (mounted) {
-          _pdfController.jumpToPage(savedPage);
-        }
+        _pdfController.jumpToPage(savedPage);
       }
     } catch (e) {
       debugPrint('Failed to restore progress: $e');
@@ -1726,20 +1724,26 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> {
                           ),
                         ),
                       ),
-                    // Loading overlay while PDF is parsing
-                    if (!_isPdfReady)
-                      Positioned.fill(
-                        child: Container(
-                          color: isDark
-                              ? AppColors.darkBackground
-                              : Colors.white,
-                          child: Center(
-                            child: CircularProgressIndicator(
-                              color: AppColors.primaryBlue,
+                    // Loading overlay while PDF is parsing — fades out quickly
+                    Positioned.fill(
+                      child: IgnorePointer(
+                        ignoring: _isPdfReady,
+                        child: AnimatedOpacity(
+                          opacity: _isPdfReady ? 0.0 : 1.0,
+                          duration: const Duration(milliseconds: 200),
+                          child: Container(
+                            color: isDark
+                                ? AppColors.darkBackground
+                                : Colors.white,
+                            child: Center(
+                              child: const CircularProgressIndicator(
+                                color: AppColors.primaryBlue,
+                              ),
                             ),
                           ),
                         ),
                       ),
+                    ),
                   ],
                 ),
     );

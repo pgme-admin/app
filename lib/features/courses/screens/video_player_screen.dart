@@ -139,16 +139,12 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> {
     });
 
     try {
-      // Load existing progress for resume position (awaited so player starts at right pos)
-      await _loadExistingProgress();
-
-      // Check for locally downloaded video first, but NOT if it's still downloading
+      // Check for locally downloaded video first (fast disk check)
       final isCurrentlyDownloading = Provider.of<DownloadProvider>(context, listen: false)
           .isDownloading(widget.videoId);
       if (!isCurrentlyDownloading) {
         final downloadedPath = await DownloadService().getDownloadedPath('video_${widget.videoId}.mp4');
         if (downloadedPath != null) {
-          // Load persisted metadata for proper title/duration display
           final offlineVideo = await OfflineStorageService().getOfflineVideo(widget.videoId);
           if (offlineVideo != null) {
             debugPrint('VideoPlayer: using local file at $downloadedPath');
@@ -156,15 +152,19 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> {
             _isLocalFile = true;
             _videoTitle = offlineVideo.title;
             _videoDurationSeconds = offlineVideo.durationSeconds;
+            // For local files: load progress from fast local sources only, skip network API
+            await _loadLocalProgress();
             _initializePlayer();
             return;
           }
-          // File exists but no metadata = orphaned partial file, ignore it
           debugPrint('VideoPlayer: local file found but no metadata, streaming instead');
         }
       } else {
         debugPrint('VideoPlayer: download in progress, streaming instead');
       }
+
+      // For streaming: load full progress (including API) before player init
+      await _loadExistingProgress();
 
       final videoData =
           await _dashboardService.getVideoPlaybackData(widget.videoId);
@@ -306,6 +306,64 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> {
     print('===== VideoPlayer RESUME: pos=${bestPosition}s from $bestSource, completed=$bestCompleted =====');
   }
 
+  /// Fast progress loading for local/downloaded videos — skips network API call
+  Future<void> _loadLocalProgress() async {
+    int bestPosition = 0;
+    String bestSource = 'none';
+
+    // 0. Route param
+    if (widget.resumeFromSeconds != null && widget.resumeFromSeconds! > 0) {
+      bestPosition = widget.resumeFromSeconds!;
+      bestSource = 'route-param';
+    }
+
+    // 1. DashboardProvider (in-memory, instant)
+    try {
+      final dashboard =
+          Provider.of<DashboardProvider>(context, listen: false);
+      final lastWatched = dashboard.lastWatchedVideo;
+      if (lastWatched != null && lastWatched.videoId == widget.videoId) {
+        final dashPos = lastWatched.positionSeconds;
+        if (dashPos > bestPosition) {
+          bestPosition = dashPos;
+          bestSource = 'dashboard';
+        }
+      }
+    } catch (_) {}
+
+    // 2. Local SharedPreferences (fast disk read)
+    try {
+      final local =
+          await OfflineStorageService().getVideoProgress(widget.videoId);
+      if (local != null) {
+        final localPos = (local['positionSeconds'] as num?)?.toInt() ?? 0;
+        if (localPos > bestPosition) {
+          bestPosition = localPos;
+          bestSource = 'local';
+        }
+      }
+    } catch (_) {}
+
+    // 3. In-memory provider (instant)
+    try {
+      final provider =
+          Provider.of<EnrolledCoursesProvider>(context, listen: false);
+      final providerProgress = provider.getProgressForLecture(widget.videoId);
+      if (providerProgress != null) {
+        _watchTimeSeconds = providerProgress.watchTimeSeconds;
+        final provPos = providerProgress.lastWatchedPositionSeconds;
+        if (provPos > bestPosition) {
+          bestPosition = provPos;
+          bestSource = 'provider';
+        }
+      }
+    } catch (_) {}
+
+    _localResumePosition = bestPosition;
+    // ignore: avoid_print
+    print('===== VideoPlayer LOCAL RESUME: pos=${bestPosition}s from $bestSource =====');
+  }
+
   // ---------------------------------------------------------------------------
   // Player Initialization
   // ---------------------------------------------------------------------------
@@ -340,6 +398,12 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> {
         useAsmsTracks: true,
         useAsmsSubtitles: true,
         useAsmsAudioTracks: true,
+        bufferingConfiguration: const BetterPlayerBufferingConfiguration(
+          minBufferMs: 2000,
+          maxBufferMs: 30000,
+          bufferForPlaybackMs: 1500,
+          bufferForPlaybackAfterRebufferMs: 3000,
+        ),
       );
     }
 
@@ -424,7 +488,7 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> {
           _pendingSeekSeconds = 0; // consume so we don't seek again
           // ignore: avoid_print
           print('===== VideoPlayer SEEKING to ${seekTo}s =====');
-          Future.delayed(const Duration(milliseconds: 300), () {
+          Future.delayed(const Duration(milliseconds: 100), () {
             if (_isDisposed || _playerController == null) return;
             _playerController!.seekTo(Duration(seconds: seekTo)).then((_) {
               // ignore: avoid_print

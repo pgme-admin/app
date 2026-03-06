@@ -64,15 +64,15 @@ class _DashboardScreenState extends State<DashboardScreen> {
                 child: Row(
                   children: [
                     Container(
-                      width: isTablet ? 52 : 40,
-                      height: isTablet ? 52 : 40,
+                      width: isTablet ? 58 : 44,
+                      height: isTablet ? 58 : 44,
                       decoration: BoxDecoration(
                         color: Colors.white.withValues(alpha: 0.2),
-                        borderRadius: BorderRadius.circular(isTablet ? 14 : 10),
+                        borderRadius: BorderRadius.circular(isTablet ? 16 : 12),
                       ),
                       child: Icon(
                         Icons.menu_book_rounded,
-                        size: isTablet ? 28 : 22,
+                        size: isTablet ? 32 : 26,
                         color: Colors.white,
                       ),
                     ),
@@ -160,7 +160,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
                                   onTap: () => context.push('/profile'),
                                   child: Icon(
                                     Icons.person_outline_rounded,
-                                    size: isTablet ? 34 : 28,
+                                    size: isTablet ? 38 : 30,
                                     color: isDark ? AppColors.darkTextSecondary : const Color(0xFF555555),
                                   ),
                                 ),
@@ -249,7 +249,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
                                     child: Center(
                                       child: Icon(
                                         Icons.notifications_outlined,
-                                        size: isTablet ? 34 : 22,
+                                        size: isTablet ? 38 : 26,
                                         color: isDark ? AppColors.darkTextSecondary : const Color(0xFF555555),
                                       ),
                                     ),

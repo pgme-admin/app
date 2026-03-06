@@ -644,16 +644,16 @@ class _LectureVideoScreenState extends State<LectureVideoScreen> with TickerProv
     final secondaryColor = isDark ? AppColors.darkTextSecondary : const Color(0xFF666666);
     final lockBgColor = isDark ? AppColors.darkCardBackground : const Color(0xFFDCEAF7);
 
-    final lessonHeight = isTablet ? 72.0 : 56.0;
-    final iconContainerSize = isTablet ? 36.0 : 28.0;
-    final iconSize = isTablet ? 20.0 : 16.0;
-    final lockSize = isTablet ? 18.0 : 14.0;
-    final titleSize = isTablet ? 15.0 : 12.0;
-    final metaSize = isTablet ? 13.0 : 10.0;
-    final avatarSize = isTablet ? 22.0 : 16.0;
+    final lessonHeight = isTablet ? 80.0 : 60.0;
+    final iconContainerSize = isTablet ? 42.0 : 32.0;
+    final iconSize = isTablet ? 24.0 : 18.0;
+    final lockSize = isTablet ? 22.0 : 16.0;
+    final titleSize = isTablet ? 16.0 : 13.0;
+    final metaSize = isTablet ? 14.0 : 11.0;
+    final avatarSize = isTablet ? 26.0 : 18.0;
     final itemRadius = isTablet ? 16.0 : 12.0;
     final itemHPadding = isTablet ? 16.0 : 12.0;
-    final downloadIconSize = isTablet ? 22.0 : 18.0;
+    final downloadIconSize = isTablet ? 28.0 : 22.0;
 
     // Determine which icon to show
     IconData iconData;
@@ -819,8 +819,8 @@ class _LectureVideoScreenState extends State<LectureVideoScreen> with TickerProv
                           if (downloadProgress != null && downloadProgress > 0)
                             // Small progress indicator for downloading state
                             SizedBox(
-                              width: isTablet ? 14.0 : 11.0,
-                              height: isTablet ? 14.0 : 11.0,
+                              width: isTablet ? 18.0 : 14.0,
+                              height: isTablet ? 18.0 : 14.0,
                               child: CircularProgressIndicator(
                                 value: downloadProgress,
                                 strokeWidth: 1.5,
@@ -830,16 +830,16 @@ class _LectureVideoScreenState extends State<LectureVideoScreen> with TickerProv
                           else
                             Icon(
                               downloadStatusIcon,
-                              size: isTablet ? 14.0 : 11.0,
+                              size: isTablet ? 18.0 : 14.0,
                               color: downloadStatusColor,
                             ),
-                          SizedBox(width: isTablet ? 5 : 4),
+                          SizedBox(width: isTablet ? 6 : 4),
                           Text(
                             downloadStatusText,
                             style: TextStyle(
                               fontFamily: 'Poppins',
                               fontWeight: FontWeight.w500,
-                              fontSize: isTablet ? 11.0 : 9.0,
+                              fontSize: isTablet ? 13.0 : 10.0,
                               color: downloadStatusColor,
                             ),
                           ),
@@ -853,9 +853,12 @@ class _LectureVideoScreenState extends State<LectureVideoScreen> with TickerProv
             // Cancel button when downloading
             if (downloadProgress != null && onCancel != null)
               GestureDetector(
+                behavior: HitTestBehavior.opaque,
                 onTap: onCancel,
-                child: Padding(
-                  padding: EdgeInsets.all(isTablet ? 8.0 : 6.0),
+                child: Container(
+                  width: isTablet ? 44 : 38,
+                  height: isTablet ? 44 : 38,
+                  alignment: Alignment.center,
                   child: Icon(
                     Icons.close,
                     size: downloadIconSize,
@@ -866,9 +869,12 @@ class _LectureVideoScreenState extends State<LectureVideoScreen> with TickerProv
             // Retry button when failed or paused
             else if (showRetryButton)
               GestureDetector(
+                behavior: HitTestBehavior.opaque,
                 onTap: onRetry,
-                child: Padding(
-                  padding: EdgeInsets.all(isTablet ? 8.0 : 6.0),
+                child: Container(
+                  width: isTablet ? 44 : 38,
+                  height: isTablet ? 44 : 38,
+                  alignment: Alignment.center,
                   child: Icon(
                     isFailed ? Icons.refresh : Icons.play_arrow,
                     size: downloadIconSize + 2,
@@ -879,9 +885,12 @@ class _LectureVideoScreenState extends State<LectureVideoScreen> with TickerProv
             // Download button (only when not downloading/downloaded/failed)
             else if (showDownloadButton)
               GestureDetector(
+                behavior: HitTestBehavior.opaque,
                 onTap: onDownload,
-                child: Padding(
-                  padding: EdgeInsets.all(isTablet ? 8.0 : 6.0),
+                child: Container(
+                  width: isTablet ? 44 : 38,
+                  height: isTablet ? 44 : 38,
+                  alignment: Alignment.center,
                   child: Icon(
                     Icons.download_outlined,
                     size: downloadIconSize,
