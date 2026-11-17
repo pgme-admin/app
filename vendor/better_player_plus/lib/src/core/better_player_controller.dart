@@ -10,6 +10,7 @@ import 'package:better_player_plus/src/video_player/video_player.dart';
 import 'package:better_player_plus/src/video_player/video_player_platform_interface.dart';
 import 'package:collection/collection.dart' show IterableExtension;
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart' show DeviceOrientation, SystemUiOverlay;
 import 'package:path_provider/path_provider.dart';
 
 ///Class used to control overall Better Player behavior. Main class to change
@@ -71,6 +72,15 @@ class BetterPlayerController {
 
   ///Flag used to store full screen mode state.
   bool get isFullScreen => _isFullScreen;
+
+  /// PGME patch: one-shot override for what BetterPlayer restores when the
+  /// fullscreen route is left. When non-null, these replace the configuration's
+  /// `deviceOrientationsAfterFullScreen` / `systemOverlaysAfterFullScreen` for
+  /// that exit. Used when the host screen is going straight into another
+  /// landscape layout, so the phone is not flipped to portrait and back (a
+  /// visible flash). Callers must reset both to null afterwards.
+  List<DeviceOrientation>? deviceOrientationsAfterFullScreenOverride;
+  List<SystemUiOverlay>? systemOverlaysAfterFullScreenOverride;
 
   ///Time when last progress event was sent
   int _lastPositionSelection = 0;

@@ -217,9 +217,13 @@ class _BetterPlayerState extends State<BetterPlayer> with WidgetsBindingObserver
 
     await SystemChrome.setEnabledSystemUIMode(
       SystemUiMode.manual,
-      overlays: _betterPlayerConfiguration.systemOverlaysAfterFullScreen,
+      overlays: widget.controller.systemOverlaysAfterFullScreenOverride ??
+          _betterPlayerConfiguration.systemOverlaysAfterFullScreen,
     );
-    await SystemChrome.setPreferredOrientations(_betterPlayerConfiguration.deviceOrientationsAfterFullScreen);
+    await SystemChrome.setPreferredOrientations(
+      widget.controller.deviceOrientationsAfterFullScreenOverride ??
+          _betterPlayerConfiguration.deviceOrientationsAfterFullScreen,
+    );
   }
 
   Widget _buildPlayer() => VisibilityDetector(

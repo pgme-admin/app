@@ -1,10 +1,13 @@
 import 'dart:async';
 import 'dart:io';
+import 'dart:ui' as ui;
 
 import 'package:dio/dio.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_epub_viewer/flutter_epub_viewer.dart';
+import 'package:flutter_inappwebview/flutter_inappwebview.dart'
+    show ScreenshotConfiguration, CompressFormat;
 import 'package:go_router/go_router.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:provider/provider.dart';
@@ -16,6 +19,7 @@ import 'package:pgme/core/services/highlight_service.dart';
 import 'package:pgme/core/theme/app_theme.dart';
 import 'package:pgme/core/utils/responsive_helper.dart';
 import 'package:pgme/core/widgets/app_dialog.dart';
+import 'package:pgme/features/notes/widgets/page_curl.dart';
 
 class EpubViewerScreen extends StatefulWidget {
   final String? documentId;
@@ -33,7 +37,8 @@ class EpubViewerScreen extends StatefulWidget {
   State<EpubViewerScreen> createState() => _EpubViewerScreenState();
 }
 
-class _EpubViewerScreenState extends State<EpubViewerScreen> {
+class _EpubViewerScreenState extends State<EpubViewerScreen>
+    with SingleTickerProviderStateMixin {
   final EpubController _epubController = EpubController();
   final HighlightService _highlightService = HighlightService();
   final BookmarkService _bookmarkService = BookmarkService();
@@ -47,6 +52,36 @@ class _EpubViewerScreenState extends State<EpubViewerScreen> {
   bool _isSearchOpen = false;
   bool _isDarkMode = false;
   bool _isScrollMode = false;
+
+  // Tapping the page hides/shows the header, progress row and bottom action
+  // bar so the text gets the whole screen (matters most in landscape).
+  bool _chromeVisible = true;
+  // Touch tracking from the book's own onTouchDown/onTouchUp callbacks
+  // (normalized 0..1 coordinates). Used for tap-to-toggle chrome and, on iOS,
+  // swipe-to-turn-page.
+  Offset? _touchDown;
+  DateTime? _touchDownAt;
+  bool _touchDownHadSelection = false;
+  bool _hasSelection = false;
+
+  // Book view size + pending re-align after a resize (see _onBookViewSize).
+  Size? _bookViewSize;
+  Timer? _reanchorTimer;
+  // Reading-mode switches reload the book (see _toggleReadingMode).
+  int _viewerGeneration = 0;
+  String? _resumeCfi;
+
+  // iOS flip mode: page turns play a paper-curl animation (see _turnPage).
+  late final AnimationController _curlAnim = AnimationController(
+      vsync: this, duration: const Duration(milliseconds: 450));
+  late final Animation<double> _curlProgress =
+      CurvedAnimation(parent: _curlAnim, curve: Curves.easeInOut);
+  ui.FragmentProgram? _curlProgram;
+  ui.Image? _curlImage; // still of the page that curls
+  ui.Image? _curlBackdrop; // still under the curl (previous-page turns)
+  bool _turning = false;
+  bool? _queuedTurnForward;
+  Completer<String?>? _turnRelocated;
 
   // Current selection
   String? _selectedCfi;
@@ -82,7 +117,18 @@ class _EpubViewerScreenState extends State<EpubViewerScreen> {
             Provider.of<ThemeProvider>(context, listen: false).isDarkMode;
       }
     });
+    if (Platform.isIOS) {
+      PageCurl.load().then((program) => _curlProgram = program);
+    }
     _loadEpub();
+  }
+
+  @override
+  void dispose() {
+    _reanchorTimer?.cancel();
+    _curlAnim.dispose();
+    _takeCurlImages().forEach((image) => image.dispose());
+    super.dispose();
   }
 
   // ── EPUB loading ──────────────────────────────────────────────────
@@ -241,7 +287,11 @@ class _EpubViewerScreenState extends State<EpubViewerScreen> {
         }
       } catch (e) {
         if (mounted) {
-          showAppDialog(context, message: 'Failed to add bookmark', type: AppDialogType.info);
+          showAppDialog(context,
+              message: e.toString().replaceFirst('Exception: ', '').trim().isEmpty
+                  ? 'Failed to add bookmark'
+                  : e.toString().replaceFirst('Exception: ', '').trim(),
+              type: AppDialogType.info);
         }
       }
     }
@@ -701,34 +751,258 @@ class _EpubViewerScreenState extends State<EpubViewerScreen> {
             ? SystemUiOverlayStyle.light.copyWith(statusBarColor: Colors.transparent)
             : SystemUiOverlayStyle.dark.copyWith(statusBarColor: Colors.transparent)),
       body: Column(children: [
-        _buildToolbar(isDark, textColor, toolbarColor, isTablet),
-        // Chapter + progress indicator
-        if (_isEpubReady)
-          Container(
-            width: double.infinity,
-            padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 4),
-            color: toolbarColor,
-            child: Row(children: [
-              Expanded(child: Text(
-                _currentChapter.isNotEmpty ? _currentChapter : widget.title,
-                style: TextStyle(fontSize: 11, color: isDark ? AppColors.darkTextTertiary : Colors.grey[500]),
-                maxLines: 1, overflow: TextOverflow.ellipsis)),
-              Text('${(_readProgress * 100).toInt()}%',
-                style: TextStyle(fontSize: 11, fontWeight: FontWeight.w600,
-                  color: isDark ? AppColors.darkTextTertiary : Colors.grey[500])),
-            ]),
-          ),
-        if (_isEpubReady)
-          LinearProgressIndicator(
-            value: _readProgress, backgroundColor: Colors.transparent,
-            color: AppColors.primaryBlue, minHeight: 2),
+        // No size animation here: every intermediate size would make the
+        // book engine re-layout mid-animation (see _onBookViewSize).
+        _chromeVisible
+              ? Column(children: [
+                  _buildToolbar(isDark, textColor, toolbarColor, isTablet),
+                  // Chapter + progress indicator. Space is reserved even
+                  // before the book is ready so the book view keeps one size
+                  // from the start (a resize right after the first page is
+                  // drawn could leave the book on a blank page).
+                  Visibility(
+                    visible: _isEpubReady,
+                    maintainSize: true,
+                    maintainAnimation: true,
+                    maintainState: true,
+                    child: Container(
+                      width: double.infinity,
+                      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 4),
+                      color: toolbarColor,
+                      child: Row(children: [
+                        Expanded(child: Text(
+                          _currentChapter.isNotEmpty ? _currentChapter : widget.title,
+                          style: TextStyle(fontSize: 11, color: isDark ? AppColors.darkTextTertiary : Colors.grey[500]),
+                          maxLines: 1, overflow: TextOverflow.ellipsis)),
+                        // Tap the percentage to jump to a location.
+                        GestureDetector(
+                          onTap: _showGoToLocationDialog,
+                          behavior: HitTestBehavior.opaque,
+                          child: Container(
+                            padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+                            decoration: BoxDecoration(
+                              color: AppColors.primaryBlue.withValues(alpha: 0.1),
+                              borderRadius: BorderRadius.circular(10)),
+                            child: Text('${(_readProgress * 100).toInt()}%',
+                              style: const TextStyle(fontSize: 11, fontWeight: FontWeight.w600,
+                                color: AppColors.primaryBlue))),
+                        ),
+                      ]),
+                    ),
+                  ),
+                  Visibility(
+                    visible: _isEpubReady,
+                    maintainSize: true,
+                    maintainAnimation: true,
+                    maintainState: true,
+                    child: LinearProgressIndicator(
+                      value: _readProgress, backgroundColor: Colors.transparent,
+                      color: AppColors.primaryBlue, minHeight: 2),
+                  ),
+                ])
+              // Hidden: keep only the status-bar inset so text never sits
+              // under the clock.
+              : SizedBox(
+                  width: double.infinity,
+                  height: MediaQuery.of(context).padding.top),
         Expanded(
           child: _error != null
               ? _buildError(textColor, isTablet)
               : _isLoading ? _buildLoading(isTablet) : _buildEpubViewer(isDark)),
-        if (_isEpubReady) _buildBottomActionBar(isDark, isTablet),
+        _chromeVisible
+            // Reserved (invisible, not tappable) until the book is ready.
+            ? Visibility(
+                visible: _isEpubReady,
+                maintainSize: true,
+                maintainAnimation: true,
+                maintainState: true,
+                child: _buildBottomActionBar(isDark, isTablet),
+              )
+            : SizedBox(
+                width: double.infinity,
+                height: MediaQuery.of(context).padding.bottom),
       ]),
     );
+  }
+
+  // ── Page navigation + go-to-location ──────────────────────────────
+
+  void _onBookTouchDown(double x, double y) {
+    _touchDown = Offset(x, y);
+    _touchDownAt = DateTime.now();
+    _touchDownHadSelection = _hasSelection;
+  }
+
+  void _onBookTouchUp(double x, double y) {
+    final down = _touchDown;
+    final at = _touchDownAt;
+    _touchDown = null;
+    _touchDownAt = null;
+    // While text is selected, taps and drags belong to the selection UI.
+    if (down == null || at == null || !_isEpubReady) return;
+    if (_touchDownHadSelection || _hasSelection) return;
+
+    final dx = x - down.dx;
+    final dy = y - down.dy;
+    final heldMs = DateTime.now().difference(at).inMilliseconds;
+
+    // A quick, stationary touch is a tap: show/hide the reader chrome. (A long
+    // press starts a text selection and must not toggle anything.)
+    if (dx.abs() < 0.03 && dy.abs() < 0.03 && heldMs < 350) {
+      setState(() => _chromeVisible = !_chromeVisible);
+      return;
+    }
+
+    // iOS only: swipe left/right turns the page in paginated mode. Android's
+    // built-in swipe handler (enabled by the package on Android) already does
+    // this, so doing it here too would turn two pages at once there.
+    if (Platform.isIOS &&
+        !_isScrollMode &&
+        dx.abs() >= 0.2 &&
+        dx.abs() > dy.abs() * 1.5) {
+      _turnPage(forward: dx < 0);
+    }
+  }
+
+  /// iOS flip mode: turn the page with a paper curl, like Apple Books. The
+  /// book is drawn by a web view that Flutter cannot bend, so a still of the
+  /// page is laid over it: for "next" the real page turns underneath and the
+  /// still curls away to reveal it; for "previous" the previous page's still
+  /// curls back in over a still of the current page. Without the shader, or
+  /// if a still cannot be taken, the page just turns as before.
+  Future<void> _turnPage({required bool forward}) async {
+    if (!_isEpubReady || _isScrollMode) return;
+    if (_turning) {
+      _queuedTurnForward = forward; // play it once this turn finishes
+      return;
+    }
+    void turnBook() => forward ? _epubController.next() : _epubController.prev();
+    // While text is selected the book refuses to turn; nothing to animate.
+    if (_curlProgram == null || _hasSelection) {
+      turnBook();
+      return;
+    }
+    _turning = true;
+    final startCfi = _currentCfi;
+    try {
+      final current = await _snapshotBook();
+      if (!mounted) {
+        current?.dispose();
+        return;
+      }
+      if (current == null) {
+        turnBook();
+        return;
+      }
+      // Cover the book with a plain still of the current page. It needs no
+      // shader, so it reaches the screen straight away.
+      setState(() => _curlBackdrop = current);
+      // The still must be on screen before the page changes under it: let
+      // this frame and one more go through.
+      await WidgetsBinding.instance.endOfFrame;
+      if (!mounted) return;
+      WidgetsBinding.instance.scheduleFrame();
+      await WidgetsBinding.instance.endOfFrame;
+      if (!mounted) return;
+      final relocated = _turnRelocated = Completer<String?>();
+      turnBook();
+      final newCfi = await relocated.future
+          .timeout(const Duration(seconds: 1), onTimeout: () => null);
+      // First/last page: the book did not move, so there is nothing to turn.
+      if (!mounted || newCfi == null || newCfi == startCfi) return;
+      if (forward) {
+        // Give the web view a moment to paint the new page underneath.
+        await Future<void>.delayed(const Duration(milliseconds: 40));
+        if (!mounted) return;
+        // The still now curls away, revealing the new page.
+        setState(() {
+          _curlAnim.value = 0;
+          _curlImage = current;
+          _curlBackdrop = null;
+        });
+        await _curlAnim.forward(from: 0).orCancel;
+      } else {
+        final previous = await _snapshotBook();
+        if (!mounted || previous == null) {
+          previous?.dispose();
+          return;
+        }
+        setState(() {
+          _curlAnim.value = 1;
+          _curlImage = previous;
+        });
+        await _curlAnim.reverse(from: 1).orCancel;
+      }
+    } on TickerCanceled {
+      // Screen closed mid-turn.
+    } finally {
+      _turnRelocated = null;
+      _turning = false;
+      final stills = _takeCurlImages();
+      if (mounted) {
+        setState(() {});
+        // Free the stills once the frame without them is drawn.
+        WidgetsBinding.instance.addPostFrameCallback(
+            (_) => stills.forEach((image) => image.dispose()));
+        final queued = _queuedTurnForward;
+        _queuedTurnForward = null;
+        if (queued != null) _turnPage(forward: queued);
+      } else {
+        for (final image in stills) {
+          image.dispose();
+        }
+      }
+    }
+  }
+
+  /// Removes the page-turn stills from the screen state and hands them back
+  /// for disposal.
+  List<ui.Image> _takeCurlImages() {
+    final stills = <ui.Image>{
+      if (_curlImage != null) _curlImage!,
+      if (_curlBackdrop != null) _curlBackdrop!,
+    }.toList();
+    _curlImage = null;
+    _curlBackdrop = null;
+    return stills;
+  }
+
+  /// A still picture of the book as it is on screen now (null on failure).
+  Future<ui.Image?> _snapshotBook() async {
+    try {
+      // PNG keeps the web view's transparent margins transparent (JPEG
+      // would turn them black).
+      final bytes = await _epubController.webViewController?.takeScreenshot(
+          screenshotConfiguration:
+              ScreenshotConfiguration(compressFormat: CompressFormat.PNG));
+      if (bytes == null) return null;
+      final codec = await ui.instantiateImageCodec(bytes);
+      final frame = await codec.getNextFrame();
+      codec.dispose();
+      return frame.image;
+    } catch (e) {
+      debugPrint('[EPUB] page still failed: $e');
+      return null;
+    }
+  }
+
+  Future<void> _showGoToLocationDialog() async {
+    if (!_isEpubReady) return;
+    final isDark = Provider.of<ThemeProvider>(context, listen: false).isDarkMode;
+    final value = await showDialog<int>(
+      context: context,
+      builder: (_) => _GoToLocationDialog(
+        initialPercent: (_readProgress * 100).round().clamp(0, 100),
+        isDark: isDark,
+      ),
+    );
+    if (value == null || !mounted) return;
+    // Let the dialog and the keyboard finish closing first. Hiding the keyboard
+    // resizes the web view, and epub.js responds to a resize by re-displaying
+    // its previous location, which would undo a jump made at the same moment.
+    await Future<void>.delayed(const Duration(milliseconds: 450));
+    if (!mounted) return;
+    _epubController.toProgressPercentage((value / 100).clamp(0.0, 1.0));
   }
 
   Widget _buildToolbar(bool isDark, Color textColor, Color toolbarColor, bool isTablet) {
@@ -770,11 +1044,7 @@ class _EpubViewerScreenState extends State<EpubViewerScreen> {
                     color: _isCurrentLocationBookmarked ? AppColors.primaryBlue : textColor))),
             // Scroll/page toggle
             GestureDetector(
-              onTap: () {
-                setState(() => _isScrollMode = !_isScrollMode);
-                _epubController.setFlow(
-                  flow: _isScrollMode ? EpubFlow.scrolled : EpubFlow.paginated);
-              },
+              onTap: _toggleReadingMode,
               child: Container(
                 width: isTablet ? 44 : 36, height: isTablet ? 44 : 36,
                 margin: EdgeInsets.only(right: isTablet ? 4 : 2),
@@ -878,18 +1148,57 @@ class _EpubViewerScreenState extends State<EpubViewerScreen> {
         ])));
   }
 
+  /// Flip (paginated) <-> scroll. The book engine's in-place flow switch
+  /// leaves it unable to turn pages afterwards (next/prev stay on the same
+  /// page), so the book is reloaded cleanly in the new mode, opening at the
+  /// current location, and the saved highlights/underlines are re-applied.
+  void _toggleReadingMode() {
+    if (!_isEpubReady || _turning) return;
+    _reanchorTimer?.cancel();
+    setState(() {
+      _isScrollMode = !_isScrollMode;
+      _resumeCfi = _currentCfi;
+      _viewerGeneration++;
+      _isEpubReady = false;
+    });
+  }
+
+  /// Puts the already-loaded highlights/underlines onto a freshly loaded book.
+  void _reapplyAnnotations() {
+    for (final h in _highlights.values) {
+      final cfi = h['cfi'];
+      if (cfi != null && cfi.isNotEmpty) {
+        _epubController.addHighlight(
+            cfi: cfi, color: _colorFromName(h['color'] ?? 'yellow'));
+      }
+    }
+    for (final u in _underlines.values) {
+      final cfi = u['cfi'];
+      if (cfi != null && cfi.isNotEmpty) _epubController.addUnderline(cfi: cfi);
+    }
+  }
+
   Widget _buildEpubViewer(bool isDark) {
     final epubSource = _localPath != null
         ? EpubSource.fromFile(File(_localPath!))
         : EpubSource.fromUrl(widget.epubUrl!);
 
-    return Stack(children: [
+    return LayoutBuilder(builder: (context, constraints) {
+      _onBookViewSize(constraints.biggest);
+      return Stack(children: [
       EpubViewer(
+        key: ValueKey('epub-viewer-$_viewerGeneration'),
         epubSource: epubSource,
         epubController: _epubController,
+        initialCfi: _resumeCfi,
         displaySettings: EpubDisplaySettings(
           flow: _isScrollMode ? EpubFlow.scrolled : EpubFlow.paginated,
-          snap: true, useSnapAnimationAndroid: false,
+          // iOS: epub.js's snap paging never sees touches made inside the
+          // book's iframe, so a drag free-scrolled the pages (half-turned or
+          // blank pages) and a swipe could also trigger our own turn. Off on
+          // iOS: pages turn only via next()/prev() (swipe + arrow buttons),
+          // and _applyBookLayoutFixes stops drags from moving the pages.
+          snap: !Platform.isIOS, useSnapAnimationAndroid: false,
           theme: _isDarkMode ? EpubTheme.dark() : EpubTheme.light(),
           allowScriptedContent: false),
         selectionContextMenu: ContextMenu(
@@ -903,11 +1212,20 @@ class _EpubViewerScreenState extends State<EpubViewerScreen> {
         onChaptersLoaded: (chapters) {
           if (!_isEpubReady && mounted) {
             setState(() => _isEpubReady = true);
-            _loadData();
+            if (_dataLoaded) {
+              _reapplyAnnotations(); // reloaded after a reading-mode switch
+            } else {
+              _loadData();
+            }
+            _applyBookLayoutFixes();
           }
         },
         onEpubLoaded: () => debugPrint('EPUB loaded'),
         onRelocated: (value) {
+          final pendingTurn = _turnRelocated;
+          if (pendingTurn != null && !pendingTurn.isCompleted) {
+            pendingTurn.complete(value.startCfi);
+          }
           if (mounted) {
             _currentCfi = value.startCfi;
             setState(() {
@@ -919,14 +1237,145 @@ class _EpubViewerScreenState extends State<EpubViewerScreen> {
         onTextSelected: (sel) {
           _selectedCfi = sel.selectionCfi;
           _selectedText = sel.selectedText;
+          _hasSelection = true;
         },
+        onDeselection: () => _hasSelection = false,
+        onTouchDown: _onBookTouchDown,
+        onTouchUp: _onBookTouchUp,
         onAnnotationClicked: (cfi, data) => _onAnnotationClicked(cfi),
       ),
+      // Page turn in progress: stills of the page over the book (see
+      // _turnPage). Touches on the book wait until the turn is done.
+      if (_curlImage != null || _curlBackdrop != null)
+        Positioned.fill(
+          child: AbsorbPointer(
+            child: Stack(fit: StackFit.expand, children: [
+              // The stills have transparent margins (the web view is
+              // transparent there), so they sit on the screen's background.
+              if (_curlBackdrop != null)
+                ColoredBox(
+                  color: isDark ? AppColors.darkBackground : Colors.white,
+                  child: RawImage(image: _curlBackdrop, fit: BoxFit.fill)),
+              if (_curlImage != null && _curlProgram != null)
+                PageCurl(
+                  program: _curlProgram!,
+                  image: _curlImage!,
+                  progress: _curlProgress,
+                  paperColor:
+                      _isDarkMode ? const Color(0xff121212) : Colors.white,
+                  backgroundColor:
+                      isDark ? AppColors.darkBackground : Colors.white),
+            ]),
+          ),
+        ),
+      // iOS paginated mode: visible previous/next buttons. Swipe-to-turn goes
+      // through the web view's touch events, which are not reliable on iOS;
+      // these turn the page through the book's own prev()/next() so turning
+      // pages always works.
+      if (Platform.isIOS && !_isScrollMode && _isEpubReady) ...[
+        Positioned(
+          left: 4, top: 0, bottom: 0,
+          child: Center(child: _pageTurnButton(
+            icon: Icons.chevron_left, isDark: isDark, tooltip: 'Previous page',
+            onTap: () => _turnPage(forward: false))),
+        ),
+        Positioned(
+          right: 4, top: 0, bottom: 0,
+          child: Center(child: _pageTurnButton(
+            icon: Icons.chevron_right, isDark: isDark, tooltip: 'Next page',
+            onTap: () => _turnPage(forward: true))),
+        ),
+      ],
       if (!_isEpubReady)
         Container(
           color: isDark ? AppColors.darkBackground : Colors.white,
           child: const Center(child: CircularProgressIndicator(color: AppColors.primaryBlue))),
     ]);
+    });
+  }
+
+  /// Called on every layout of the book view. When its size changes after
+  /// the book is shown (header hidden/shown, rotation), the book engine
+  /// re-lays out its pages and can end up between pages (a blank page). Once
+  /// the size has settled, re-display the current location to re-align.
+  void _onBookViewSize(Size size) {
+    final previous = _bookViewSize;
+    _bookViewSize = size;
+    if (previous == null || previous == size || !_isEpubReady) return;
+    _reanchorTimer?.cancel();
+    _reanchorTimer = Timer(const Duration(milliseconds: 400), () {
+      final cfi = _currentCfi;
+      if (!mounted || cfi == null || cfi.isEmpty) return;
+      _epubController.display(cfi: cfi);
+    });
+  }
+
+  /// Layout fixes for the reader page, applied each time a book loads.
+  ///
+  /// All platforms: the reader page sets the book's height to the web view's
+  /// height as a bare number, which the browser ignores — except when that
+  /// height is 0, i.e. when the book loads before the web view has been laid
+  /// out. The book then gets a height of 0 and is centred in the page's
+  /// 800pt-tall body, so every page shows 400pt too low (far down the screen,
+  /// or blank on smaller phones). Clearing that inline height restores the
+  /// page's own 100% height.
+  ///
+  /// iOS: snap is off here, which also leaves the web view free to scroll up
+  /// and down; the body's 800pt minimum height (taller than most phone
+  /// screens) is dropped so the page fits the view and cannot be dragged.
+  /// In flip (paginated) mode finger drags must not scroll the page strip,
+  /// so it never rests between two pages; next()/prev() still turn pages.
+  Future<void> _applyBookLayoutFixes() async {
+    final isIOS = Platform.isIOS;
+    try {
+      final result = await _epubController.webViewController?.evaluateJavascript(source: '''
+        (function () {
+          var viewer = document.getElementById('viewer');
+          var stuckHeight = viewer ? viewer.style.height : '';
+          if (viewer) viewer.style.height = '';
+          if ($isIOS) {
+            if (!document.getElementById('pgme-reader-fixes')) {
+              var st = document.createElement('style');
+              st.id = 'pgme-reader-fixes';
+              st.textContent = 'body{min-height:0 !important;}' +
+                'html.pgme-paginated .epub-container' +
+                '{overflow:hidden !important;-webkit-overflow-scrolling:auto !important;}';
+              document.head.appendChild(st);
+            }
+            document.documentElement.classList.toggle('pgme-paginated', ${!_isScrollMode});
+          }
+          return stuckHeight;
+        })();
+      ''');
+      if (result is String && result.isNotEmpty) {
+        debugPrint('[EPUB] book height was stuck at "$result"; reset');
+      }
+    } catch (e) {
+      debugPrint('[EPUB] layout fixes not applied: $e');
+    }
+  }
+
+  Widget _pageTurnButton({
+    required IconData icon,
+    required bool isDark,
+    required String tooltip,
+    required VoidCallback onTap,
+  }) {
+    return Material(
+      color: (isDark ? Colors.white : Colors.black).withValues(alpha: 0.08),
+      shape: const StadiumBorder(),
+      child: InkWell(
+        customBorder: const StadiumBorder(),
+        onTap: onTap,
+        child: Tooltip(
+          message: tooltip,
+          child: SizedBox(
+            width: 36, height: 56,
+            child: Icon(icon, size: 26,
+              color: isDark ? Colors.white70 : Colors.black54)),
+        ),
+      ),
+    );
   }
 
   Widget _buildLoading(bool isTablet) {
@@ -953,5 +1402,84 @@ class _EpubViewerScreenState extends State<EpubViewerScreen> {
         },
         child: const Text('Retry')),
     ]));
+  }
+}
+
+/// "Go to location" dialog: jumps to a percentage of the book. Owns its text
+/// controller and focus node so they are disposed with the dialog, and takes
+/// focus after the first frame (same pattern as the PDF viewer's go-to-page
+/// dialog; TextField's built-in autofocus races with disposal).
+class _GoToLocationDialog extends StatefulWidget {
+  final int initialPercent;
+  final bool isDark;
+
+  const _GoToLocationDialog({
+    required this.initialPercent,
+    required this.isDark,
+  });
+
+  @override
+  State<_GoToLocationDialog> createState() => _GoToLocationDialogState();
+}
+
+class _GoToLocationDialogState extends State<_GoToLocationDialog> {
+  late final TextEditingController _controller;
+  late final FocusNode _focusNode;
+  String? _error;
+
+  @override
+  void initState() {
+    super.initState();
+    _controller = TextEditingController(text: widget.initialPercent.toString());
+    _focusNode = FocusNode();
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) return;
+      _focusNode.requestFocus();
+      _controller.selection =
+          TextSelection(baseOffset: 0, extentOffset: _controller.text.length);
+    });
+  }
+
+  @override
+  void dispose() {
+    _focusNode.dispose();
+    _controller.dispose();
+    super.dispose();
+  }
+
+  void _submit() {
+    final v = int.tryParse(_controller.text.trim());
+    if (v == null || v < 0 || v > 100) {
+      setState(() => _error = 'Enter a number from 0 to 100');
+      return;
+    }
+    Navigator.of(context).pop(v);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return AlertDialog(
+      backgroundColor:
+          widget.isDark ? AppColors.darkCardBackground : Colors.white,
+      title: const Text('Go to location'),
+      content: TextField(
+        controller: _controller,
+        focusNode: _focusNode,
+        keyboardType: TextInputType.number,
+        inputFormatters: [FilteringTextInputFormatter.digitsOnly],
+        onSubmitted: (_) => _submit(),
+        decoration: InputDecoration(
+          labelText: 'Percentage of the book',
+          suffixText: '%',
+          errorText: _error,
+        ),
+      ),
+      actions: [
+        TextButton(
+            onPressed: () => Navigator.of(context).pop(),
+            child: const Text('Cancel')),
+        TextButton(onPressed: _submit, child: const Text('Go')),
+      ],
+    );
   }
 }

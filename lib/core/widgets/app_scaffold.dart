@@ -3,6 +3,7 @@ import 'package:flutter/services.dart';
 import 'package:go_router/go_router.dart';
 import 'package:provider/provider.dart';
 import 'package:pgme/core/providers/theme_provider.dart';
+import 'package:pgme/core/providers/mini_player_provider.dart';
 import 'package:pgme/core/theme/app_theme.dart';
 import 'package:pgme/core/utils/responsive_helper.dart';
 import 'package:pgme/core/widgets/mini_player_widget.dart';
@@ -22,6 +23,31 @@ class AppScaffold extends StatelessWidget {
   });
 
   /// Handle Android back button press
+  /// Space a scrolling page inside this scaffold must leave after its last
+  /// item so that item clears the floating bottom navigation bar, and the
+  /// mini player when it is showing. Mirrors the geometry in [build].
+  /// Pass [listen] true from build() so the inset updates when the mini
+  /// player appears or goes away.
+  static double bottomContentInset(BuildContext context, {bool listen = true}) {
+    final isTablet = ResponsiveHelper.isTablet(context);
+    final navBarHeight = isTablet ? 88.0 : 70.0;
+    const navBottomMargin = 12.0;
+    const gapAboveNav = 16.0;
+    var inset = MediaQuery.of(context).padding.bottom +
+        navBottomMargin +
+        navBarHeight +
+        gapAboveNav;
+    try {
+      final mini = Provider.of<MiniPlayerProvider>(context, listen: listen);
+      if (mini.isMinimized && mini.controller != null) {
+        inset += 60.0 + 8.0; // MiniPlayerWidget height + its gap above the nav
+      }
+    } catch (_) {
+      // No provider above this context: nothing extra to clear.
+    }
+    return inset;
+  }
+
   void _handleBackButton(BuildContext context, bool didPop) {
     if (didPop) return; // Already popped by the system
 

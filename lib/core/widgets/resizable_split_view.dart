@@ -13,6 +13,12 @@ class ResizableSplitView extends StatefulWidget {
   final double minRatio;
   final double maxRatio;
 
+  /// Smallest size (logical px along [axis]) the second child may get. The
+  /// first child's ratio is capped so the second child never drops below
+  /// this — e.g. so a PDF reader beside a video stays wide enough for its
+  /// toolbar. 0 = no limit beyond [maxRatio].
+  final double minSecondExtent;
+
   const ResizableSplitView({
     super.key,
     required this.firstChild,
@@ -21,6 +27,7 @@ class ResizableSplitView extends StatefulWidget {
     this.initialRatio = 0.4,
     this.minRatio = 0.25,
     this.maxRatio = 0.75,
+    this.minSecondExtent = 0,
   });
 
   @override
@@ -75,9 +82,14 @@ class _ResizableSplitViewState extends State<ResizableSplitView> {
         final secondChild = widget.secondChild;
         final divider = _buildDivider(isVertical, totalSize);
 
+        final maxRatio = _effectiveMaxRatio(available);
+
         return ValueListenableBuilder<double>(
           valueListenable: _ratio,
-          builder: (context, ratio, _) {
+          builder: (context, storedRatio, _) {
+            // The stored ratio is kept as the user set it (it is shared by
+            // both orientations); only what is displayed is capped.
+            final ratio = storedRatio.clamp(widget.minRatio, maxRatio);
             final firstSize = (available * ratio).clamp(0.0, available);
             final secondSize = (available - firstSize).clamp(0.0, available);
             return Flex(
@@ -155,9 +167,19 @@ class _ResizableSplitViewState extends State<ResizableSplitView> {
     );
   }
 
+  /// [ResizableSplitView.maxRatio], lowered when needed so the second child
+  /// keeps at least [ResizableSplitView.minSecondExtent].
+  double _effectiveMaxRatio(double available) {
+    if (widget.minSecondExtent <= 0 || available <= 0) return widget.maxRatio;
+    final cap = 1 - widget.minSecondExtent / available;
+    if (cap < widget.minRatio) return widget.minRatio;
+    return cap < widget.maxRatio ? cap : widget.maxRatio;
+  }
+
   void _onDrag(double delta, double totalSize) {
     if (totalSize <= 0) return;
-    _ratio.value =
-        (_ratio.value + delta / totalSize).clamp(widget.minRatio, widget.maxRatio);
+    final maxRatio = _effectiveMaxRatio(totalSize - _dividerThickness);
+    final current = _ratio.value.clamp(widget.minRatio, maxRatio);
+    _ratio.value = (current + delta / totalSize).clamp(widget.minRatio, maxRatio);
   }
 }

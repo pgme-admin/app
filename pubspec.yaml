@@ -1,7 +1,7 @@
 name: pgme
 description: Post Graduate Medical Education - A complete medical education platform
 publish_to: 'none'
-version: 2.0.6+17
+version: 2.0.7+25
 
 environment:
   sdk: '>=3.0.0 <4.0.0'
@@ -40,7 +40,13 @@ dependencies:
   shimmer: ^3.0.0
   path_provider: ^2.1.2
   syncfusion_flutter_pdfviewer: ^28.1.33
+  # Text extraction for placing saved highlights (already pulled in by the
+  # viewer at the same version; declared because the reader imports it).
+  syncfusion_flutter_pdf: ^28.2.12
   flutter_epub_viewer: ^1.2.8
+  # Web view the EPUB reader runs in (already pulled in by flutter_epub_viewer
+  # at this version); declared because the reader takes page stills with it.
+  flutter_inappwebview: ^6.1.5
   pdfrx: ^1.0.100
   firebase_core: ^3.12.1
   firebase_messaging: ^15.2.4
@@ -95,6 +101,9 @@ flutter:
     - .env
     - assets/zoho_payment.html
     - shorebird.yaml
+
+  shaders:
+    - shaders/page_curl.frag
 
   # fonts:
   #   - family: Inter

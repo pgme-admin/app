@@ -14,7 +14,14 @@ class ProgressService {
       );
 
       if (response.statusCode == 200 && response.data['success'] == true) {
-        return response.data['data'] as Map<String, dynamic>;
+        // The backend wraps the row as data: { progress: { page_number, ... } }
+        // (progress is null when the user has none yet). Callers read
+        // page_number from the returned map, so unwrap it here; without this
+        // every document reopened at page 1.
+        final data = response.data['data'] as Map<String, dynamic>;
+        final progress = data['progress'];
+        if (progress is Map<String, dynamic>) return progress;
+        return progress == null && data.containsKey('progress') ? {} : data;
       }
       return {};
     } on DioException catch (e) {

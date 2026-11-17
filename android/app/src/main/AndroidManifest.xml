@@ -31,6 +31,14 @@
     <uses-feature android:name="android.hardware.camera" android:required="false" />
     <uses-feature android:name="android.hardware.camera.autofocus" android:required="false" />
     <uses-feature android:name="android.hardware.microphone" android:required="false" />
+
+    <!-- READ_PHONE_STATE, BLUETOOTH and location permissions imply required
+         hardware features (telephony, bluetooth, location, gps). Declaring
+         them optional keeps the app installable on Wi-Fi-only tablets. -->
+    <uses-feature android:name="android.hardware.telephony" android:required="false" />
+    <uses-feature android:name="android.hardware.bluetooth" android:required="false" />
+    <uses-feature android:name="android.hardware.location" android:required="false" />
+    <uses-feature android:name="android.hardware.location.gps" android:required="false" />
     <application
         android:label="pgme"
         android:name="${applicationName}"

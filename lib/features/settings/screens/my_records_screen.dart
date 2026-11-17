@@ -12,7 +12,7 @@ import 'package:pgme/core/widgets/shimmer_widgets.dart';
 import 'package:pgme/core/utils/responsive_helper.dart';
 import 'package:pgme/core/utils/web_store_launcher.dart';
 import 'package:pgme/features/purchase/widgets/upgrade_options_sheet.dart';
-import 'package:pgme/features/notes/screens/pdf_viewer_screen.dart';
+import 'package:pgme/core/utils/pdf_engine_policy.dart';
 import 'package:pgme/core/widgets/app_dialog.dart';
 
 class MyRecordsScreen extends StatefulWidget {
@@ -136,7 +136,7 @@ class _MyRecordsScreenState extends State<MyRecordsScreen>
       if (!mounted) return;
       Navigator.of(context, rootNavigator: true).push(
         MaterialPageRoute(
-          builder: (_) => PdfViewerScreen(
+          builder: (_) => PdfEnginePolicy.buildReader(
             filePath: file.path,
             title: invoice!.invoiceNumber,
           ),
@@ -361,7 +361,7 @@ class _MyRecordsScreenState extends State<MyRecordsScreen>
       if (!mounted) return;
       Navigator.of(context, rootNavigator: true).push(
         MaterialPageRoute(
-          builder: (_) => PdfViewerScreen(
+          builder: (_) => PdfEnginePolicy.buildReader(
             filePath: file.path,
             title: invoice!.invoiceNumber,
           ),
@@ -424,7 +424,7 @@ class _MyRecordsScreenState extends State<MyRecordsScreen>
       if (!mounted) return;
       Navigator.of(context, rootNavigator: true).push(
         MaterialPageRoute(
-          builder: (_) => PdfViewerScreen(
+          builder: (_) => PdfEnginePolicy.buildReader(
             filePath: file.path,
             title: invoice!.invoiceNumber,
           ),
@@ -1276,7 +1276,7 @@ class _InvoiceDownloadButtonState extends State<_InvoiceDownloadButton> {
       // Open in the in-app PDF viewer
       Navigator.of(context, rootNavigator: true).push(
         MaterialPageRoute(
-          builder: (_) => PdfViewerScreen(
+          builder: (_) => PdfEnginePolicy.buildReader(
             filePath: file.path,
             title: widget.invoice.invoiceNumber,
           ),

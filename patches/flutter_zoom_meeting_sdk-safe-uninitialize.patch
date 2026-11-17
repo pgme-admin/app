@@ -1,0 +1,24 @@
+--- a/android/src/main/kotlin/com/simitgroup/flutter_zoom_meeting_sdk/FlutterZoomMeetingSdkPlugin.kt
++++ b/android/src/main/kotlin/com/simitgroup/flutter_zoom_meeting_sdk/FlutterZoomMeetingSdkPlugin.kt
+@@ -92,7 +92,20 @@
+         channel.setMethodCallHandler(null)
+         eventChannel.setStreamHandler(null)
+ 
+-        ZoomSDK.getInstance().uninitialize()
++        // PGME: only uninitialize an SDK that was actually initialized, and never
++        // let a native-library failure crash engine teardown. On Android initZoom
++        // is a no-op (the SDK is initialized lazily in authZoom), so exiting the
++        // app (Back on Android 10, which destroys the engine) before any meeting
++        // used to call uninitialize() on an SDK whose native library was never
++        // loaded -> uncaught UnsatisfiedLinkError, app crash on exit.
++        try {
++            val sdk = ZoomSDK.getInstance()
++            if (sdk.isInitialized) {
++                sdk.uninitialize()
++            }
++        } catch (t: Throwable) {
++            Log.w("FlutterZoomMeetingSdk", "Zoom uninitialize skipped on detach", t)
++        }
+     }
+ 
+     private fun authZoom(call: MethodCall) : StandardZoomResponse{

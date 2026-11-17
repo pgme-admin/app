@@ -117,6 +117,23 @@ if (allowScreenCapture) {
     logger.warn("*** PGME: building with screenshots and screen recording ENABLED — do not distribute to students ***")
 }
 
+// The release build type silently falls back to the DEBUG key when
+// android/key.properties is missing (see buildTypes above). That is fine for
+// local development, but a debug-signed "release" APK cannot update or replace
+// a release-signed install of com.pgme.app on a device ("App not installed").
+// Do not fail the build — just make the situation impossible to miss.
+if (!keystorePropertiesFile.exists() &&
+    gradle.startParameter.taskNames.any { it.contains("release", ignoreCase = true) }
+) {
+    logger.warn(
+        "\n*** PGME WARNING: a release build was requested but android/key.properties is missing. ***\n" +
+        "*** This build will be signed with the DEBUG key, NOT the release key. ***\n" +
+        "*** A debug-signed APK cannot update or replace an app installed from a release-signed build ***\n" +
+        "*** (Android reports \"App not installed\"), and it must not be shipped to testers or stores. ***\n" +
+        "*** Create android/key.properties with the release keystore details to sign properly. ***\n"
+    )
+}
+
 flutter {
     source = "../.."
 }

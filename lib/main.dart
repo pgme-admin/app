@@ -10,6 +10,7 @@ import 'package:pgme/core/theme/app_theme.dart';
 import 'package:pgme/core/routes/app_router.dart';
 import 'package:pgme/core/providers/theme_provider.dart';
 import 'package:pgme/core/services/pdf_cache_service.dart';
+import 'package:pgme/core/utils/pdf_engine_policy.dart';
 import 'package:pgme/core/utils/responsive_helper.dart';
 import 'package:wakelock_plus/wakelock_plus.dart';
 import 'package:pgme/core/services/push_notification_service.dart';
@@ -84,6 +85,12 @@ Future<void> main() async {
     DeviceOrientation.landscapeLeft,
     DeviceOrientation.landscapeRight,
   ]);
+
+  // Cache the Android API level so PDF readers can pick pdfrx on old devices.
+  // Never throws and is time-capped inside; getter is safe if this is skipped.
+  try {
+    await PdfEnginePolicy.init();
+  } catch (_) {}
 
   // Run the app immediately — heavy initialization (Firebase, dotenv, etc.)
   // happens inside the splash screen so it shows right away

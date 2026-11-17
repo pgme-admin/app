@@ -6,6 +6,13 @@ import FirebaseMessaging
 @main
 @objc class AppDelegate: FlutterAppDelegate {
   private var screenProtectionOverlay: UIView?
+
+  /// True only for testing builds archived with PGME_ALLOW_SCREEN_CAPTURE=YES
+  /// (Info.plist key PGMEAllowScreenCapture). Must never be set for students.
+  private var allowsScreenCapture: Bool {
+    (Bundle.main.object(forInfoDictionaryKey: "PGMEAllowScreenCapture") as? String)?
+      .uppercased() == "YES"
+  }
   private var backgroundTaskId: UIBackgroundTaskIdentifier = .invalid
 
   override func application(
@@ -63,14 +70,20 @@ import FirebaseMessaging
     }
 
     // Watch for screen recording / mirroring and show a blocking overlay.
-    NotificationCenter.default.addObserver(
-      self,
-      selector: #selector(screenCaptureChanged),
-      name: UIScreen.capturedDidChangeNotification,
-      object: nil
-    )
-    if UIScreen.main.isCaptured {
-      screenCaptureChanged()
+    // Skipped only in testing builds archived with
+    // PGME_ALLOW_SCREEN_CAPTURE=YES (pairs with the Dart ALLOW_SCREEN_CAPTURE
+    // define and Android's PGME_ALLOW_SCREEN_CAPTURE). Any normal build leaves
+    // the setting empty, so recording stays blocked.
+    if !allowsScreenCapture {
+      NotificationCenter.default.addObserver(
+        self,
+        selector: #selector(screenCaptureChanged),
+        name: UIScreen.capturedDidChangeNotification,
+        object: nil
+      )
+      if UIScreen.main.isCaptured {
+        screenCaptureChanged()
+      }
     }
 
     return super.application(application, didFinishLaunchingWithOptions: launchOptions)

@@ -19,10 +19,12 @@ import 'package:pgme/features/courses/providers/download_provider.dart';
 import 'package:pgme/features/courses/providers/enrolled_courses_provider.dart';
 import 'package:pgme/features/courses/widgets/star_rating_input.dart';
 import 'package:pgme/features/courses/widgets/document_picker_sheet.dart';
-// Swapped to the pdfrx-backed inline viewer for split-view testing.
-// Original Syncfusion-based viewer remains available at:
-//   import 'package:pgme/features/courses/widgets/inline_pdf_viewer.dart';
-import 'package:pgme/features/courses/widgets/inline_pdf_viewer_pdfrx.dart';
+// The split pane hosts the full pdfrx reader in `embedded` mode, so the pane has
+// the same annotation tools (highlight, underline, notes, undo, bookmarks) as
+// the full-screen reader. The lightweight read-only viewer remains available at:
+//   import 'package:pgme/features/courses/widgets/inline_pdf_viewer_pdfrx.dart';
+import 'package:pgme/features/notes/screens/pdf_viewer_screen_pdfrx.dart'
+    as pdfrx_reader;
 import 'package:pgme/core/models/selectable_document.dart';
 import 'package:pgme/core/widgets/resizable_split_view.dart';
 import 'package:pgme/features/home/providers/dashboard_provider.dart';
@@ -105,12 +107,19 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> with WidgetsBindi
   bool _isSplitViewActive = false;
   SelectableDocument? _activeDocument;
 
+  // "Study mode": landscape, immersive layout with the video on the left and
+  // the notes PDF on the right. Entered from the fullscreen player's Notes
+  // button so a student can read along while watching fullscreen.
+  bool _isStudyMode = false;
 
   // Fullscreen overlay
   OverlayEntry? _fullscreenBackButtonOverlay;
   bool _isFullscreen = false;
   bool _controlsVisible = true;
   Timer? _controlsHideTimer;
+
+  // MiniPlayerProvider captured in initState (see there for why).
+  MiniPlayerProvider? _miniProvider;
 
   // Mini player support: when true, dispose() will NOT destroy the controller
   bool _isMinimizing = false;
@@ -123,6 +132,11 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> with WidgetsBindi
 
     // Check if MiniPlayerProvider already has a live controller for this video
     final miniProvider = Provider.of<MiniPlayerProvider>(context, listen: false);
+    // Kept for dispose(): looking the provider up from `context` there fails
+    // (the element is already deactivated), which left a disposed controller
+    // registered and crashed the next open of the same video when it was
+    // "adopted" ("VideoPlayerController was used after being disposed").
+    _miniProvider = miniProvider;
     if (miniProvider.videoId == widget.videoId && miniProvider.controller != null) {
       // Reuse the existing controller — player was expanded from mini mode
       debugPrint('VideoPlayer: adopting controller from MiniPlayerProvider');
@@ -229,11 +243,13 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> with WidgetsBindi
       _playerController = null;
       // Also close the mini player provider if it was referencing this controller
       try {
-        final miniProvider = Provider.of<MiniPlayerProvider>(context, listen: false);
-        if (miniProvider.videoId == widget.videoId) {
+        final miniProvider = _miniProvider;
+        if (miniProvider != null && miniProvider.videoId == widget.videoId) {
           miniProvider.unregister();
         }
-      } catch (_) {}
+      } catch (e) {
+        debugPrint('VideoPlayer: mini player unregister failed: $e');
+      }
     }
 
     // Restore device-appropriate orientations on the way out (tablets get
@@ -1109,6 +1125,53 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> with WidgetsBindi
                     ),
                   ),
                 ),
+                // Notes button - leaves fullscreen and shows the notes PDF
+                // on the right of the video (study mode). Same visibility
+                // rules as the back button.
+                Positioned(
+                  top: 16,
+                  right: 16,
+                  child: SafeArea(
+                    child: AnimatedOpacity(
+                      opacity: _controlsVisible ? 1.0 : 0.0,
+                      duration: const Duration(milliseconds: 300),
+                      child: IgnorePointer(
+                        ignoring: !_controlsVisible,
+                        child: Material(
+                          color: Colors.transparent,
+                          child: InkWell(
+                            onTap: _enterStudyModeFromFullscreen,
+                            borderRadius: BorderRadius.circular(24),
+                            child: Container(
+                              padding: const EdgeInsets.symmetric(
+                                  horizontal: 14, vertical: 8),
+                              decoration: BoxDecoration(
+                                color: Colors.black.withValues(alpha: 0.6),
+                                borderRadius: BorderRadius.circular(24),
+                              ),
+                              child: const Row(
+                                mainAxisSize: MainAxisSize.min,
+                                children: [
+                                  Icon(Icons.menu_book,
+                                      color: Colors.white, size: 22),
+                                  SizedBox(width: 8),
+                                  Text(
+                                    'Notes',
+                                    style: TextStyle(
+                                      color: Colors.white,
+                                      fontSize: 15,
+                                      fontWeight: FontWeight.w600,
+                                    ),
+                                  ),
+                                ],
+                              ),
+                            ),
+                          ),
+                        ),
+                      ),
+                    ),
+                  ),
+                ),
               ],
             ),
           );
@@ -1117,6 +1180,73 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> with WidgetsBindi
     );
 
     Overlay.of(context).insert(_fullscreenBackButtonOverlay!);
+  }
+
+  /// Leaves BetterPlayer's fullscreen route and switches to study mode:
+  /// landscape + immersive, video on the left, notes PDF on the right.
+  /// Opens the document picker first when no PDF is open yet.
+  Future<void> _enterStudyModeFromFullscreen() async {
+    final controller = _playerController;
+    if (controller == null) return;
+
+    // BetterPlayer restores portrait + visible system bars the moment its
+    // fullscreen route pops, which flashed the screen to portrait before our
+    // landscape lock landed. Tell it to keep landscape + hidden bars for this
+    // one exit instead. Cleared in `finally` so normal fullscreen exits are
+    // unchanged.
+    controller.deviceOrientationsAfterFullScreenOverride = const [
+      DeviceOrientation.landscapeLeft,
+      DeviceOrientation.landscapeRight,
+    ];
+    controller.systemOverlaysAfterFullScreenOverride = const <SystemUiOverlay>[];
+    try {
+      controller.exitFullScreen();
+      // Wait for BetterPlayer to pop its fullscreen route...
+      for (var i = 0; i < 30 && controller.isFullScreen; i++) {
+        await Future<void>.delayed(const Duration(milliseconds: 100));
+      }
+      // ...and to finish its own (now landscape-preserving) reset.
+      await Future<void>.delayed(const Duration(milliseconds: 500));
+      if (!mounted || _isDisposed) return;
+
+      await _applyStudyModeChrome();
+      if (!mounted || _isDisposed) return;
+      setState(() => _isStudyMode = true);
+    } finally {
+      controller.deviceOrientationsAfterFullScreenOverride = null;
+      controller.systemOverlaysAfterFullScreenOverride = null;
+    }
+
+    if (_activeDocument == null && mounted) {
+      _openDocumentPicker();
+    }
+  }
+
+  Future<void> _applyStudyModeChrome() async {
+    await SystemChrome.setPreferredOrientations(const [
+      DeviceOrientation.landscapeLeft,
+      DeviceOrientation.landscapeRight,
+    ]);
+    await SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersiveSticky);
+  }
+
+  /// Leaves study mode and returns to the normal (portrait) layout. The PDF
+  /// stays open in the split view if one was chosen.
+  Future<void> _exitStudyMode() async {
+    if (!_isStudyMode) return;
+    await SystemChrome.setEnabledSystemUIMode(
+      SystemUiMode.manual,
+      overlays: SystemUiOverlay.values,
+    );
+    await SystemChrome.setPreferredOrientations(_isSplitViewActive
+        ? const [
+            DeviceOrientation.portraitUp,
+            DeviceOrientation.portraitDown,
+            DeviceOrientation.landscapeLeft,
+            DeviceOrientation.landscapeRight,
+          ]
+        : ResponsiveHelper.supportedOrientationsForDevice());
+    if (mounted) setState(() => _isStudyMode = false);
   }
 
   void _startControlsHideTimer(VoidCallback onHide) {
@@ -1143,28 +1273,44 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> with WidgetsBindi
       backgroundColor: Colors.transparent,
       builder: (_) => DocumentPickerSheet(
         onDocumentSelected: (doc) {
-          SystemChrome.setPreferredOrientations([
-            DeviceOrientation.portraitUp,
-            DeviceOrientation.portraitDown,
-            DeviceOrientation.landscapeLeft,
-            DeviceOrientation.landscapeRight,
-          ]);
+          // In study mode the layout stays locked to landscape.
+          if (!_isStudyMode) {
+            SystemChrome.setPreferredOrientations([
+              DeviceOrientation.portraitUp,
+              DeviceOrientation.portraitDown,
+              DeviceOrientation.landscapeLeft,
+              DeviceOrientation.landscapeRight,
+            ]);
+          }
           setState(() {
             _activeDocument = doc;
             _isSplitViewActive = true;
           });
         },
       ),
-    );
+    ).then((_) {
+      // Picker dismissed without a choice while in study mode: nothing to
+      // show beside the video, so go back to the normal layout.
+      if (mounted && _isStudyMode && _activeDocument == null) {
+        _exitStudyMode();
+      }
+    });
   }
 
   void _closeSplitView() {
-    SystemChrome.setPreferredOrientations(
-        ResponsiveHelper.supportedOrientationsForDevice());
     setState(() {
       _isSplitViewActive = false;
       _activeDocument = null;
     });
+    if (_isStudyMode) {
+      // Closing the PDF also ends study mode (restores UI + orientation).
+      // Runs after the split state is cleared so the device-appropriate
+      // orientations are restored, not the split-view ones.
+      _exitStudyMode();
+    } else {
+      SystemChrome.setPreferredOrientations(
+          ResponsiveHelper.supportedOrientationsForDevice());
+    }
   }
 
   Widget _buildSplitView() {
@@ -1179,9 +1325,23 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> with WidgetsBindi
           initialRatio: 0.4,
           minRatio: 0.25,
           maxRatio: 0.75,
+          // Side by side (landscape), keep the PDF pane wide enough for the
+          // reader's toolbar and annotation bar. Without this, a video made
+          // large in portrait kept the same ratio on rotation and squeezed
+          // the reader to ~25% of the width, cutting off its buttons.
+          minSecondExtent: axis == Axis.horizontal ? 360 : 0,
           firstChild: _buildSplitPlayerArea(),
-          secondChild: InlinePdfViewerPdfrx(
-            document: _activeDocument!,
+          // Full pdfrx reader in embedded mode: highlight, underline, notes,
+          // undo, bookmarks and search all work inside the split pane.
+          // Keyed by document so switching documents rebuilds the reader.
+          secondChild: pdfrx_reader.PdfViewerScreen(
+            key: ValueKey('split-pdf-${_activeDocument!.id}'),
+            documentId: _activeDocument!.id,
+            source: _activeDocument!.source == DocumentSource.ebook
+                ? 'ebook'
+                : null,
+            title: _activeDocument!.title,
+            embedded: true,
             onClose: _closeSplitView,
           ),
         );
@@ -1192,8 +1352,9 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> with WidgetsBindi
   /// Player area for split view — wraps in a black Container so the
   /// AspectRatio scales down within the flex-allocated space.
   Widget _buildSplitPlayerArea() {
+    Widget area;
     if (_playerController != null && _isPlayerInitialized) {
-      return Container(
+      area = Container(
         color: Colors.black,
         child: Center(
           child: AspectRatio(
@@ -1202,14 +1363,43 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> with WidgetsBindi
           ),
         ),
       );
+    } else {
+      // Loading / error state — simple centered indicator, no fixed aspect ratio
+      area = Container(
+        color: Colors.black,
+        child: const Center(
+          child: CircularProgressIndicator(color: Colors.white),
+        ),
+      );
     }
 
-    // Loading / error state — simple centered indicator, no fixed aspect ratio
-    return Container(
-      color: Colors.black,
-      child: const Center(
-        child: CircularProgressIndicator(color: Colors.white),
-      ),
+    if (!_isStudyMode) return area;
+
+    // Study mode hides the app chrome, so give the student a way out.
+    return Stack(
+      children: [
+        Positioned.fill(child: area),
+        Positioned(
+          top: 8,
+          left: 8,
+          child: Material(
+            color: Colors.transparent,
+            child: InkWell(
+              onTap: _exitStudyMode,
+              borderRadius: BorderRadius.circular(20),
+              child: Container(
+                padding: const EdgeInsets.all(8),
+                decoration: BoxDecoration(
+                  color: Colors.black.withValues(alpha: 0.6),
+                  borderRadius: BorderRadius.circular(20),
+                ),
+                child: const Icon(Icons.fullscreen_exit,
+                    color: Colors.white, size: 24),
+              ),
+            ),
+          ),
+        ),
+      ],
     );
   }
 
@@ -1251,6 +1441,12 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> with WidgetsBindi
           return;
         }
 
+        // Leave study mode first (back to the normal split/inline layout)
+        if (_isStudyMode) {
+          await _exitStudyMode();
+          return;
+        }
+
         // Close split view first, then back exits the screen
         if (_isSplitViewActive) {
           _closeSplitView();
@@ -1269,6 +1465,13 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> with WidgetsBindi
         body: SafeArea(
           child: _isSplitViewActive && _activeDocument != null
               ? _buildSplitView()
+              : _isStudyMode
+                  // Study mode while the document picker is still open: just
+                  // the video, full area, until a PDF is chosen.
+                  ? Container(
+                      color: Colors.black,
+                      child: _buildSplitPlayerArea(),
+                    )
               : OrientationBuilder(
                   builder: (context, orientation) {
                     // On a tablet in landscape, place video and info side by

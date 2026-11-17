@@ -1,14 +1,17 @@
 import 'dart:async';
 import 'dart:io';
+import 'dart:math' as math;
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:go_router/go_router.dart';
 import 'package:pdfrx/pdfrx.dart';
 import 'package:provider/provider.dart';
+import 'package:wakelock_plus/wakelock_plus.dart';
 import 'package:pgme/core/services/pdf_cache_service.dart';
 import 'package:pgme/core/constants/api_constants.dart';
 import 'package:pgme/core/models/annotation_bounds.dart';
 import 'package:pgme/core/providers/theme_provider.dart';
+import 'package:pgme/core/providers/mini_player_provider.dart';
 import 'package:pgme/core/services/api_service.dart';
 import 'package:pgme/core/services/bookmark_service.dart';
 import 'package:pgme/core/services/highlight_service.dart';
@@ -17,6 +20,7 @@ import 'package:pgme/core/services/ebook_access_service.dart';
 import 'package:pgme/core/services/progress_service.dart';
 import 'package:pgme/core/theme/app_theme.dart';
 import 'package:pgme/core/utils/responsive_helper.dart';
+import 'package:pgme/core/utils/highlight_placement.dart';
 import 'package:pgme/core/widgets/app_dialog.dart';
 import 'package:pgme/features/notes/widgets/bookmarks_drawer.dart';
 
@@ -69,6 +73,16 @@ class PdfViewerScreen extends StatefulWidget {
   /// [pdfUrl] or [filePath] is given (those skip URL resolution).
   final String? source;
 
+  /// True when this viewer is hosted inside another screen (the video
+  /// player's split view) instead of being pushed as its own route. The only
+  /// behavioural difference: the toolbar's leading button closes the pane via
+  /// [onClose] instead of popping a route. Every other feature (highlight,
+  /// underline, notes, undo, bookmarks, search, outline) is unchanged.
+  final bool embedded;
+
+  /// Called by the toolbar's leading button when [embedded] is true.
+  final VoidCallback? onClose;
+
   const PdfViewerScreen({
     super.key,
     this.documentId,
@@ -76,6 +90,8 @@ class PdfViewerScreen extends StatefulWidget {
     this.filePath,
     this.title = 'PDF Viewer',
     this.source,
+    this.embedded = false,
+    this.onClose,
   }) : assert(documentId != null || pdfUrl != null || filePath != null);
 
   @override
@@ -147,6 +163,64 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> {
   // Guards
   bool _highlightsLoaded = false;
   bool _bookmarksLoaded = false;
+  // Locates the viewer area on screen so the annotation menu can be kept
+  // inside it (see _showContextMenuFromSelection).
+  final GlobalKey _viewerAreaKey = GlobalKey();
+
+  // The SelectionArea around the PDF text, so an applied highlight/underline
+  // can clear the on-screen selection.
+  final GlobalKey<SelectionAreaState> _selectionAreaKey =
+      GlobalKey<SelectionAreaState>();
+
+  void _clearTextSelection() {
+    try {
+      _selectionAreaKey.currentState?.selectableRegion.clearSelection();
+    } catch (e) {
+      debugPrint('[PDFRX] clearSelection failed: $e');
+    }
+  }
+
+  // "Keep screen on" / "Lock rotation" menu toggles (full-screen reader
+  // only — in the video split pane the host screen owns both).
+  bool _keepScreenOn = false;
+  bool _orientationLocked = false;
+
+  // Tap-to-hide reader chrome (toolbar + bottom action bar).
+  bool _chromeVisible = true;
+  bool get _showChrome => _chromeVisible || _isSearchOpen || widget.embedded;
+  // Raw pointer tracking for tap detection. A Listener does not take part in
+  // the gesture arena, so it cannot interfere with scrolling, pinch-zoom or
+  // text selection.
+  int? _tapPointer;
+  Offset _tapDownPosition = Offset.zero;
+  DateTime _tapDownAt = DateTime.fromMillisecondsSinceEpoch(0);
+
+  void _onViewerPointerDown(PointerDownEvent e) {
+    // Only a single-finger touch can be a tap; a second finger (pinch) cancels.
+    _tapPointer = _tapPointer == null ? e.pointer : null;
+    _tapDownPosition = e.position;
+    _tapDownAt = DateTime.now();
+  }
+
+  void _onViewerPointerUp(PointerUpEvent e) {
+    if (_tapPointer != e.pointer) return;
+    _tapPointer = null;
+    final moved = (e.position - _tapDownPosition).distance;
+    final heldMs = DateTime.now().difference(_tapDownAt).inMilliseconds;
+    // A quick, stationary touch is a tap. A long press starts a text
+    // selection, and taps while a selection or the annotation menu is open
+    // belong to those, so they never toggle the chrome.
+    if (moved > 10 || heldMs > 300) return;
+    if (_currentSelections != null && _currentSelections!.isNotEmpty) return;
+    if (_contextMenuOverlay != null) return;
+    if (widget.embedded) return;
+    setState(() => _chromeVisible = !_chromeVisible);
+  }
+
+  // True once the saved reading position has been fetched/applied (or there is
+  // nothing to restore). dispose() only saves progress after this, otherwise
+  // closing the viewer quickly would overwrite the saved page with page 1.
+  bool _progressRestored = false;
 
   // Pre-loaded PDF document. We open the file and run loadPagesProgressively
   // to completion BEFORE mounting the PdfViewer — that way the user sees a
@@ -220,6 +294,18 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> {
   @override
   void initState() {
     super.initState();
+    if (!widget.embedded) {
+      // Full-screen reader: allow reading in any orientation (phones are
+      // otherwise portrait-only); dispose() restores the device default.
+      SystemChrome.setPreferredOrientations(_allOrientations);
+      // Free memory for the PDF: stop a minimized video player first, as the
+      // previous (Syncfusion) reader did.
+      try {
+        final miniProvider =
+            Provider.of<MiniPlayerProvider>(context, listen: false);
+        if (miniProvider.isActive) miniProvider.close();
+      } catch (_) {}
+    }
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (mounted) {
         final isDark =
@@ -232,17 +318,32 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> {
 
   @override
   void dispose() {
+    if (!widget.embedded) {
+      // Back to the app's device policy (phones: portrait only; tablets: any).
+      SystemChrome.setPreferredOrientations(
+          ResponsiveHelper.supportedOrientationsForDevice());
+      // The app keeps the screen awake everywhere (see main.dart). Restore
+      // that if the reader's toggle switched it off.
+      if (!_keepScreenOn) WakelockPlus.enable();
+    }
     _contextMenuOverlay?.remove();
     _contextMenuOverlay = null;
     _contextMenuDebounce?.cancel();
     _progressDebounceTimer?.cancel();
     final documentId = widget.documentId;
     final lastPage = _currentPage.value;
-    if (documentId != null && lastPage > 0) {
-      _progressService.updateDocumentProgress(
-        documentId: documentId,
-        pageNumber: lastPage,
-      );
+    // Ebook ids are not valid for the document-progress route (it 404s), and
+    // saving before the saved page was restored would reset it to page 1.
+    if (documentId != null &&
+        lastPage > 0 &&
+        widget.source != 'ebook' &&
+        _progressRestored) {
+      _progressService
+          .updateDocumentProgress(documentId: documentId, pageNumber: lastPage)
+          .catchError((Object e) {
+        debugPrint('Failed to save progress on close: $e');
+        return <String, dynamic>{};
+      });
     }
     _currentPage.dispose();
     _textSearcher?.dispose();
@@ -432,15 +533,20 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> {
     try {
       final progress =
           await _progressService.getDocumentProgress(widget.documentId!);
-      final savedPage = progress['page_number'] as int? ?? 1;
+      final savedPage = (progress['page_number'] as num?)?.toInt() ?? 1;
       if (savedPage > 1 && mounted) {
         await Future.delayed(const Duration(milliseconds: 300));
         if (mounted) {
-          _pdfController.goToPage(pageNumber: savedPage);
+          // Immediate jump: an animated jump can be cancelled by a viewport
+          // resize (keyboard / insets settling) and land on the wrong page.
+          _pdfController.goToPage(
+              pageNumber: savedPage, duration: Duration.zero);
         }
       }
     } catch (e) {
       debugPrint('Failed to restore progress: $e');
+    } finally {
+      _progressRestored = true;
     }
   }
 
@@ -530,8 +636,12 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> {
         }
       } catch (e) {
         if (mounted) {
+          // Show the server's actual reason (e.g. "already exists",
+          // "Invalid page number") instead of an unexplained generic failure.
+          final reason = e.toString().replaceFirst('Exception: ', '').trim();
           showAppDialog(context,
-              message: 'Failed to add bookmark', type: AppDialogType.info);
+              message: reason.isEmpty ? 'Failed to add bookmark' : reason,
+              type: AppDialogType.info);
         }
       }
     }
@@ -549,6 +659,11 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> {
     try {
       final highlights =
           await _highlightService.getHighlights(widget.documentId!);
+
+      // Text of every page that has a saved highlight, so each row can be
+      // placed by the words it was made on (see HighlightPlacement).
+      final pageText = await _loadPageTextForRows(highlights);
+      if (!mounted) return;
 
       for (final h in highlights) {
         try {
@@ -574,9 +689,24 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> {
 
           if (boundsData == null || boundsData.isEmpty) continue;
 
+          // Stored bounds are top-left / y-down (the convention Syncfusion
+          // writes); rows from older pdfrx builds are PDF-native y-up. Pick
+          // the placement that lands on the row's own text and convert.
+          final legacyYUp = HighlightPlacement.isYUp(
+            bounds: boundsData.cast<Map<String, dynamic>>(),
+            pageHeight: (p) {
+              final doc = _document;
+              if (doc == null || p < 1 || p > doc.pages.length) return null;
+              return _userSpaceHeight(doc.pages[p - 1]);
+            },
+            pageText: (p) => pageText[p],
+            startOffset: (h['start_offset'] as num?)?.toInt(),
+          );
           final bounds = boundsData
               .map<AnnotationTextBounds>(
                   (b) => AnnotationTextBounds.fromJson(b as Map<String, dynamic>))
+              .map<AnnotationTextBounds>(
+                  (b) => legacyYUp ? _legacyYUpToYDown(b) : b)
               .toList();
 
           final data = _AnnotationData(
@@ -607,15 +737,80 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> {
 
   // ── Coordinate conversion ─────────────────────────────────────────
 
+  /// Page height in PDF user space (rotation-independent), used to flip
+  /// between the stored top-left/y-down bounds and pdfrx's bottom-left/y-up
+  /// page coordinates.
+  static double _userSpaceHeight(PdfPage page) =>
+      (page.rotation.index & 1) == 1 ? page.width : page.height;
+
+  /// Loads the text (with positions, top-left origin) of every page that has
+  /// a saved highlight/underline, keyed by 1-based page number. Pages whose
+  /// text cannot be read are simply left out.
+  Future<Map<int, List<PageTextBox>>> _loadPageTextForRows(
+      List<dynamic> rows) async {
+    final doc = _document;
+    final result = <int, List<PageTextBox>>{};
+    if (doc == null) return result;
+
+    final pages = <int>{};
+    for (final h in rows) {
+      final bounds = (h is Map) ? h['bounds_data'] : null;
+      if (bounds is! List) continue;
+      for (final b in bounds) {
+        final p = (b is Map) ? (b['page_number'] as num?)?.toInt() : null;
+        if (p != null && p >= 1 && p <= doc.pages.length) pages.add(p);
+      }
+    }
+
+    for (final p in pages) {
+      if (!mounted) break;
+      try {
+        final page = doc.pages[p - 1];
+        final hu = _userSpaceHeight(page);
+        final text = await page.loadText();
+        result[p] = [
+          for (final f in text.fragments)
+            PageTextBox(
+              Rect.fromLTRB(f.bounds.left, hu - f.bounds.top, f.bounds.right,
+                  hu - f.bounds.bottom),
+              f.text,
+            ),
+        ];
+      } catch (e) {
+        debugPrint('[PDFRX] page $p text unavailable for highlight placement: $e');
+      }
+    }
+    return result;
+  }
+
+  AnnotationTextBounds _legacyYUpToYDown(AnnotationTextBounds b) {
+    final doc = _document;
+    if (doc == null || b.pageNumber < 1 || b.pageNumber > doc.pages.length) {
+      return b;
+    }
+    final hu = _userSpaceHeight(doc.pages[b.pageNumber - 1]);
+    return AnnotationTextBounds(
+      left: b.left,
+      top: hu - b.top, // old rows stored the PDF-space top edge
+      width: b.width,
+      height: b.height,
+      text: b.text,
+      pageNumber: b.pageNumber,
+    );
+  }
+
   Rect _boundsToScreenRect(
       AnnotationTextBounds bounds, PdfPage page, Rect pageRect) {
-    // Convert stored bounds (PDF coordinates) to screen rect using pdfrx's
-    // built-in coordinate conversion which handles Y-flip and rotation.
+    // Stored bounds are top-left / y-down. Flip to pdfrx's PDF page space
+    // (bottom-left / y-up) and let pdfrx's own conversion handle scale and
+    // rotation.
+    final hu = _userSpaceHeight(page);
+    final pdfTop = hu - bounds.top;
     final pdfRect = PdfRect(
       bounds.left,
-      bounds.top,
+      pdfTop,
       bounds.left + bounds.width,
-      bounds.top - bounds.height, // PDF coords: bottom = top - height
+      pdfTop - bounds.height, // PDF coords: bottom = top - height
     );
     return pdfRect.toRectInPageRect(page: page, pageRect: pageRect);
   }
@@ -724,13 +919,69 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> {
     _capturedBounds = _selectionToBounds(_currentSelections!);
     _capturedText = _currentSelectedText;
 
-    final screenSize = MediaQuery.of(context).size;
-    _showContextMenu(Offset(screenSize.width / 2, 120));
+    // Anchor the menu to the selection itself, kept inside the reader's own
+    // area. (It used to sit at a fixed spot near the top of the SCREEN, which
+    // in the video split pane is on top of the video, far from the text.)
+    final viewerRect = _viewerAreaGlobalRect();
+    final selectionRect = _selectionGlobalRect(_capturedBounds!);
+    if (selectionRect != null) {
+      _showContextMenu(
+        Offset(selectionRect.center.dx, selectionRect.top),
+        belowY: selectionRect.bottom,
+        within: viewerRect,
+      );
+    } else if (viewerRect != null) {
+      _showContextMenu(Offset(viewerRect.center.dx, viewerRect.top),
+          within: viewerRect);
+    } else {
+      final screenSize = MediaQuery.of(context).size;
+      _showContextMenu(Offset(screenSize.width / 2, 120));
+    }
+  }
+
+  /// Global (screen) rect of the area the PDF viewer occupies.
+  Rect? _viewerAreaGlobalRect() {
+    final box = _viewerAreaKey.currentContext?.findRenderObject();
+    if (box is! RenderBox || !box.hasSize) return null;
+    return box.localToGlobal(Offset.zero) & box.size;
+  }
+
+  /// Global (screen) rect covering the selected lines, or null if it cannot
+  /// be computed (e.g. layout not ready).
+  Rect? _selectionGlobalRect(List<AnnotationTextBounds> bounds) {
+    final doc = _document;
+    if (doc == null || bounds.isEmpty) return null;
+    try {
+      final pageLayouts = _pdfController.layout.pageLayouts;
+      Rect? union;
+      for (final b in bounds) {
+        if (b.pageNumber < 1 ||
+            b.pageNumber > doc.pages.length ||
+            b.pageNumber > pageLayouts.length) {
+          continue;
+        }
+        final docRect = _boundsToScreenRect(
+            b, doc.pages[b.pageNumber - 1], pageLayouts[b.pageNumber - 1]);
+        final tl = _pdfController.documentToGlobal(docRect.topLeft);
+        final br = _pdfController.documentToGlobal(docRect.bottomRight);
+        if (tl == null || br == null) continue;
+        final r = Rect.fromPoints(tl, br);
+        union = union == null ? r : union.expandToInclude(r);
+      }
+      return union;
+    } catch (e) {
+      debugPrint('[PDFRX] selection rect unavailable: $e');
+      return null;
+    }
   }
 
   // ── Context menu ──────────────────────────────────────────────────
 
-  void _showContextMenu(Offset position) {
+  /// Shows the annotation menu above [position] (global), or below [belowY]
+  /// when there is no room above. When [within] is given (the viewer's global
+  /// rect) the menu is kept inside it, so in the split pane it never covers
+  /// the video.
+  void _showContextMenu(Offset position, {double? belowY, Rect? within}) {
     _removeContextMenu();
 
     final isDark =
@@ -742,17 +993,25 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> {
     final menuWidth = isTablet ? 310.0 : 260.0;
     final menuHeight = isTablet ? 56.0 : 46.0;
 
+    final areaLeft = within?.left ?? 0;
+    final areaRight = within?.right ?? screenSize.width;
+    final areaTop = math.max(within?.top ?? 0, safePadding.top);
+    final areaBottom = math.min(within?.bottom ?? screenSize.height,
+        screenSize.height - safePadding.bottom);
+
     double left = position.dx - menuWidth / 2;
     double top = position.dy - menuHeight - 12;
 
-    final minLeft = safePadding.left + 8;
-    final maxLeft = screenSize.width - safePadding.right - menuWidth - 8;
+    final minLeft = math.max(areaLeft, safePadding.left) + 8;
+    final maxLeft = math.max(
+        minLeft, math.min(areaRight, screenSize.width - safePadding.right) - menuWidth - 8);
     left = left.clamp(minLeft, maxLeft);
 
-    if (top < safePadding.top + 8) top = position.dy + 12;
-    if (top + menuHeight > screenSize.height - safePadding.bottom - 8) {
-      top = screenSize.height - safePadding.bottom - menuHeight - 8;
-    }
+    // No room above the selection: put the menu just below it.
+    if (top < areaTop + 8) top = (belowY ?? position.dy) + 12;
+    // Never past the bottom of the area, never above its top.
+    if (top + menuHeight > areaBottom - 8) top = areaBottom - menuHeight - 8;
+    if (top < areaTop + 8) top = areaTop + 8;
 
     final overlay = Overlay.of(context);
     _contextMenuOverlay = OverlayEntry(
@@ -868,11 +1127,11 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> {
   // ── Convert pdfrx selections to AnnotationTextBounds ───────────────
   //
   // PdfTextRanges uses PDF coordinates (bottom-left origin, Y-up).
-  // We store bounds in the same coordinate system as Syncfusion
-  // (top-left origin, Y-down). The `_boundsToScreenRect` method
-  // handles the conversion at paint time using PdfRect.toRectInPageRect.
-  // For storage we keep PDF-native coords — both viewers can consume them
-  // via their own coord conversion.
+  // Bounds are STORED in the same coordinate system as Syncfusion
+  // (top-left origin, Y-down, page points) so a highlight made in either
+  // viewer renders in the right place in the other. `top` is converted here
+  // (userSpaceHeight - pdfTop) and `_boundsToScreenRect` converts back at
+  // paint time. (Older pdfrx builds stored y-up; see _isLegacyYUpRow.)
 
   List<AnnotationTextBounds> _selectionToBounds(
       List<PdfTextRanges> selections) {
@@ -887,6 +1146,11 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> {
     final result = <AnnotationTextBounds>[];
     for (final sel in selections) {
       final pageNumber = sel.pageNumber;
+      final doc = _document;
+      if (doc == null || pageNumber < 1 || pageNumber > doc.pages.length) {
+        continue;
+      }
+      final userSpaceHeight = _userSpaceHeight(doc.pages[pageNumber - 1]);
       final byLine = <int, _LineAccumulator>{};
       for (final range in sel.ranges) {
         final withFrags = range.toTextRangeWithFragments(sel.pageText);
@@ -913,7 +1177,7 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> {
       for (final acc in lines) {
         result.add(AnnotationTextBounds(
           left: acc.left,
-          top: acc.top,
+          top: userSpaceHeight - acc.top, // y-down (top-left origin)
           width: acc.right - acc.left,
           height: acc.top - acc.bottom, // PDF coords: top > bottom
           text: acc.text,
@@ -952,6 +1216,9 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> {
     _currentSelectedText = null;
     _capturedBounds = null;
     _capturedText = null;
+    // Remove the selection highlight + handles so the new annotation is
+    // visible straight away (they used to stay until the next tap).
+    _clearTextSelection();
 
     if (widget.documentId != null) {
       try {
@@ -966,8 +1233,10 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> {
         final result = await _highlightService.addHighlight(
           documentId: widget.documentId!,
           pageNumber: firstPage,
-          startOffset: 0,
-          endOffset: clippedText.length,
+          // start >= 1 marks "bounds are y-down" (old pdfrx rows used
+          // start == 0 with y-up bounds). Backend requires end > start.
+          startOffset: 1,
+          endOffset: clippedText.length + 1,
           highlightedText: clippedText,
           color: color,
           boundsData: boundsData,
@@ -1014,13 +1283,21 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> {
     for (final lineA in a) {
       for (final lineB in b) {
         if (lineA.pageNumber != lineB.pageNumber) continue;
-        // Coordinate-system-agnostic overlap check using X-range intersection
-        // (works regardless of Y-up vs Y-down origin since we only use left/width)
+        // Two lines overlap only when BOTH their x-ranges and y-ranges
+        // intersect (bounds are top-left / y-down). Checking x alone made any
+        // selection on the same page that shared a column with an existing
+        // underline/highlight toggle that one off instead of adding a new one.
         final aLeft = lineA.left;
         final aRight = lineA.left + lineA.width;
         final bLeft = lineB.left;
         final bRight = lineB.left + lineB.width;
-        if (aLeft < bRight && aRight > bLeft) return true;
+        final aTop = lineA.top;
+        final aBottom = lineA.top + lineA.height;
+        final bTop = lineB.top;
+        final bBottom = lineB.top + lineB.height;
+        if (aLeft < bRight && aRight > bLeft && aTop < bBottom && aBottom > bTop) {
+          return true;
+        }
       }
     }
     return false;
@@ -1040,6 +1317,7 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> {
         _currentSelectedText = null;
         _capturedBounds = null;
         _capturedText = null;
+        _clearTextSelection();
         _removeAnnotation(entry.key, isUnderline: true);
         return;
       }
@@ -1060,6 +1338,9 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> {
     _currentSelectedText = null;
     _capturedBounds = null;
     _capturedText = null;
+    // Remove the selection highlight + handles so the new annotation is
+    // visible straight away (they used to stay until the next tap).
+    _clearTextSelection();
 
     if (widget.documentId != null) {
       try {
@@ -1072,8 +1353,10 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> {
         final result = await _highlightService.addHighlight(
           documentId: widget.documentId!,
           pageNumber: firstPage,
-          startOffset: 0,
-          endOffset: clippedText.length,
+          // start >= 1 marks "bounds are y-down" (old pdfrx rows used
+          // start == 0 with y-up bounds). Backend requires end > start.
+          startOffset: 1,
+          endOffset: clippedText.length + 1,
           highlightedText: clippedText,
           color: 'blue',
           annotationType: 'underline',
@@ -2053,7 +2336,12 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> {
           // Defer jump until after dialog + keyboard close animations
           // settle. See _GoToPageDialog for full rationale.
           Future.delayed(const Duration(milliseconds: 350), () {
-            if (mounted) _pdfController.goToPage(pageNumber: n);
+            // Immediate jump (no animation): hiding the keyboard resizes the
+            // viewport, which cancels an in-flight animated jump and leaves
+            // the viewer on a much earlier page.
+            if (mounted) {
+              _pdfController.goToPage(pageNumber: n, duration: Duration.zero);
+            }
           });
         },
       ),
@@ -2881,10 +3169,41 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> {
                   // background and looked like a stuck spinner.
                   : Column(
                       children: [
-                        _buildToolbar(
-                            isDark, textColor, toolbarColor, isTablet),
-                        Expanded(child: _buildPdfViewer()),
-                        _buildBottomActionBar(isDark, isTablet),
+                        // Tapping the page hides the toolbar and the bottom
+                        // action bar so the text gets the whole screen. They
+                        // stay visible while searching, and in the video
+                        // split pane (embedded) where the close button lives
+                        // in the toolbar.
+                        AnimatedSize(
+                          duration: const Duration(milliseconds: 200),
+                          alignment: Alignment.topCenter,
+                          child: _showChrome
+                              ? _buildToolbar(
+                                  isDark, textColor, toolbarColor, isTablet)
+                              // Keep the status-bar inset while hidden.
+                              : SizedBox(
+                                  width: double.infinity,
+                                  height: MediaQuery.of(context).padding.top),
+                        ),
+                        Expanded(
+                          child: Listener(
+                            key: _viewerAreaKey,
+                            behavior: HitTestBehavior.translucent,
+                            onPointerDown: _onViewerPointerDown,
+                            onPointerUp: _onViewerPointerUp,
+                            onPointerCancel: (_) => _tapPointer = null,
+                            child: _buildPdfViewer(),
+                          ),
+                        ),
+                        AnimatedSize(
+                          duration: const Duration(milliseconds: 200),
+                          alignment: Alignment.bottomCenter,
+                          child: _showChrome
+                              ? _buildBottomActionBar(isDark, isTablet)
+                              : SizedBox(
+                                  width: double.infinity,
+                                  height: MediaQuery.of(context).padding.bottom),
+                        ),
                       ],
                     ),
     );
@@ -3045,6 +3364,7 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> {
         },
         // Suppress native copy/share/search toolbar on text selection
         selectableRegionInjector: (context, child) => SelectionArea(
+          key: _selectionAreaKey,
           contextMenuBuilder: (context, selectableRegionState) =>
               const SizedBox.shrink(),
           child: child,
@@ -3121,7 +3441,13 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> {
             Row(
               children: [
                 GestureDetector(
-                  onTap: () => context.pop(),
+                  onTap: () {
+                    if (widget.embedded) {
+                      widget.onClose?.call();
+                    } else {
+                      context.pop();
+                    }
+                  },
                   child: Container(
                     width: isTablet ? 44 : 36,
                     height: isTablet ? 44 : 36,
@@ -3131,7 +3457,7 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> {
                           ? AppColors.darkSurface
                           : const Color(0xFFF5F5F5),
                     ),
-                    child: Icon(Icons.arrow_back,
+                    child: Icon(widget.embedded ? Icons.close : Icons.arrow_back,
                         size: isTablet ? 22 : 18, color: textColor),
                   ),
                 ),
@@ -3291,6 +3617,17 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> {
             case 'theme':
               setState(() => _isPdfDarkMode = !_isPdfDarkMode);
               break;
+            case 'keep_screen_on':
+              setState(() => _keepScreenOn = !_keepScreenOn);
+              if (_keepScreenOn) {
+                WakelockPlus.enable();
+              } else {
+                WakelockPlus.disable();
+              }
+              break;
+            case 'lock_rotation':
+              _toggleRotationLock();
+              break;
           }
         },
         itemBuilder: (context) => [
@@ -3337,6 +3674,24 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> {
           //       ],
           //     ),
           //   ),
+          if (!widget.embedded)
+            _menuToggleItem(
+              value: 'keep_screen_on',
+              icon: _keepScreenOn ? Icons.lightbulb : Icons.lightbulb_outline,
+              label: _keepScreenOn ? 'Screen always on' : 'Keep screen on',
+              active: _keepScreenOn,
+              textColor: menuTextColor,
+            ),
+          if (!widget.embedded)
+            _menuToggleItem(
+              value: 'lock_rotation',
+              icon: _orientationLocked
+                  ? Icons.screen_lock_rotation
+                  : Icons.screen_rotation,
+              label: _orientationLocked ? 'Unlock rotation' : 'Lock rotation',
+              active: _orientationLocked,
+              textColor: menuTextColor,
+            ),
           if (hasBookmarks)
             PopupMenuItem<String>(
               value: 'bookmarks',
@@ -3357,6 +3712,55 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> {
       ),
     );
   }
+
+  PopupMenuItem<String> _menuToggleItem({
+    required String value,
+    required IconData icon,
+    required String label,
+    required bool active,
+    required Color textColor,
+  }) {
+    final color = active ? AppColors.primaryBlue : textColor;
+    return PopupMenuItem<String>(
+      value: value,
+      child: Row(
+        children: [
+          Icon(icon, size: 20, color: color),
+          const SizedBox(width: 12),
+          Text(label,
+              style: TextStyle(color: color, fontWeight: FontWeight.w500)),
+        ],
+      ),
+    );
+  }
+
+  /// Locks the reader to its current orientation (portrait or landscape), or
+  /// unlocks it again. Same behaviour as the Syncfusion reader's toggle.
+  void _toggleRotationLock() {
+    setState(() => _orientationLocked = !_orientationLocked);
+    if (_orientationLocked) {
+      final landscape =
+          MediaQuery.of(context).orientation == Orientation.landscape;
+      SystemChrome.setPreferredOrientations(landscape
+          ? const [
+              DeviceOrientation.landscapeLeft,
+              DeviceOrientation.landscapeRight,
+            ]
+          : const [
+              DeviceOrientation.portraitUp,
+              DeviceOrientation.portraitDown,
+            ]);
+    } else {
+      SystemChrome.setPreferredOrientations(_allOrientations);
+    }
+  }
+
+  static const _allOrientations = [
+    DeviceOrientation.portraitUp,
+    DeviceOrientation.portraitDown,
+    DeviceOrientation.landscapeLeft,
+    DeviceOrientation.landscapeRight,
+  ];
 
   Widget _buildSearchBar(bool isDark, Color textColor, bool isTablet) {
     return Row(
@@ -3429,9 +3833,12 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> {
       ),
       child: SafeArea(
         top: false,
+        // Each action gets an equal share of the width and scales down only
+        // if it does not fit (e.g. a narrow split pane), instead of the row
+        // overflowing and cutting buttons off. Normal widths look unchanged.
         child: Row(
-          mainAxisAlignment: MainAxisAlignment.spaceEvenly,
           children: [
+            for (final action in <Widget>[
             _buildBottomAction(
               icon: Icons.border_color,
               label: 'Highlight',
@@ -3475,6 +3882,12 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> {
                 isTablet: isTablet,
               );
             }),
+            ])
+              Expanded(
+                child: Center(
+                  child: FittedBox(fit: BoxFit.scaleDown, child: action),
+                ),
+              ),
           ],
         ),
       ),

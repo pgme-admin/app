@@ -3,6 +3,7 @@ import 'package:flutter/material.dart';
 import 'package:go_router/go_router.dart';
 import 'package:provider/provider.dart';
 import 'package:cached_network_image/cached_network_image.dart';
+import 'package:pgme/core/widgets/app_scaffold.dart';
 import 'package:pgme/core/providers/theme_provider.dart';
 import 'package:pgme/core/theme/app_theme.dart';
 import 'package:pgme/core/models/book_model.dart';
@@ -798,10 +799,13 @@ class _EbookListScreenState extends State<EbookListScreen>
                                     child: GridView.builder(
                                       controller: _scrollController,
                                       physics: const AlwaysScrollableScrollPhysics(parent: ClampingScrollPhysics()),
+                                      // Clear the floating bottom nav (and mini
+                                      // player) so the last row's Read button
+                                      // is never covered.
                                       padding: EdgeInsets.only(
                                         left: hPadding,
                                         right: hPadding,
-                                        bottom: 100,
+                                        bottom: AppScaffold.bottomContentInset(context),
                                       ),
                                       gridDelegate: SliverGridDelegateWithFixedCrossAxisCount(
                                         crossAxisCount: isTablet ? 3 : 2,

@@ -1,8 +1,10 @@
 import 'dart:io';
+import 'dart:math' as math;
 
 import 'package:flutter/material.dart';
 import 'package:go_router/go_router.dart';
 import 'package:provider/provider.dart';
+import 'package:pgme/core/providers/mini_player_provider.dart';
 import 'package:pgme/core/providers/theme_provider.dart';
 import 'package:pgme/core/theme/app_theme.dart';
 import 'package:pgme/core/models/library_item_model.dart';
@@ -283,6 +285,21 @@ class _YourNotesScreenState extends State<YourNotesScreen> {
     final hPadding = isTablet ? ResponsiveHelper.horizontalPadding(context) : 16.0;
     final scale = ResponsiveHelper.tabletScale(context);
 
+    // Landscape: the fixed 'Buy E-Books' banner (orderBookCardHeight, up to
+    // ~216dp on large tablets) plus the fixed header left almost no room for
+    // the list above the floating nav bar. In landscape the banner is moved
+    // into the scrollable (compact) so it scrolls away with the content, and
+    // the scroll end is padded to clear the nav bar. Portrait is unchanged.
+    final isLandscape = ResponsiveHelper.isLandscape(context);
+    final miniPlayerVisible = context.select<MiniPlayerProvider, bool>(
+      (p) => p.isMinimized && p.controller != null,
+    );
+    final landscapeBottomInset = _landscapeBottomInset(
+      context,
+      isTablet: isTablet,
+      miniPlayerVisible: miniPlayerVisible,
+    );
+
     return Scaffold(
       backgroundColor: backgroundColor,
       body: Center(
@@ -463,168 +480,65 @@ class _YourNotesScreenState extends State<YourNotesScreen> {
           SizedBox(height: isTablet ? 23 : 18),
 
           // eBook & Physical Cards
-          Padding(
-            padding: EdgeInsets.symmetric(horizontal: isTablet ? hPadding : 15),
-            child: GestureDetector(
-              onTap: () => context.push('/ebook-store'),
-              child: Container(
-                width: double.infinity,
-                height: ResponsiveHelper.orderBookCardHeight(context),
-                decoration: BoxDecoration(
-                  borderRadius: BorderRadius.circular(isTablet ? 24 : 14),
-                  gradient: LinearGradient(
-                    begin: Alignment.topLeft,
-                    end: Alignment.bottomRight,
-                    colors: isDark
-                        ? [const Color(0xFF1A3A2E), const Color(0xFF0D2A1C)]
-                        : [const Color(0xFF00875A), const Color(0xFF00C853)],
-                  ),
-                ),
-                child: Padding(
-                  padding: EdgeInsets.symmetric(
-                    horizontal: isTablet ? 24 : 16,
-                    vertical: isTablet ? 20 : 14,
-                  ),
-                  child: Row(
-                    children: [
-                      Container(
-                        width: isTablet ? 52 : 40,
-                        height: isTablet ? 52 : 40,
-                        decoration: BoxDecoration(
-                          color: Colors.white.withValues(alpha: 0.2),
-                          borderRadius: BorderRadius.circular(isTablet ? 14 : 10),
-                        ),
-                        child: Icon(
-                          Icons.menu_book_rounded,
-                          size: isTablet ? 28 : 22,
-                          color: Colors.white,
-                        ),
-                      ),
-                      SizedBox(width: isTablet ? 16 : 12),
-                      Expanded(
-                        child: Column(
-                          crossAxisAlignment: CrossAxisAlignment.start,
-                          mainAxisAlignment: MainAxisAlignment.center,
-                          children: [
-                            Text(
-                              Platform.isIOS ? 'E-Books' : 'Buy E-Books',
-                              style: TextStyle(
-                                fontFamily: 'Poppins',
-                                fontWeight: FontWeight.w600,
-                                fontSize: isTablet ? 22 * scale : 16,
-                                color: Colors.white,
-                              ),
-                            ),
-                            SizedBox(height: isTablet ? 4 : 2),
-                            Text(
-                              Platform.isIOS ? 'Browse study materials' : 'Browse and purchase study materials',
-                              style: TextStyle(
-                                fontFamily: 'Poppins',
-                                fontWeight: FontWeight.w400,
-                                fontSize: isTablet ? 15 * scale : 12,
-                                color: Colors.white.withValues(alpha: 0.7),
-                              ),
-                            ),
-                          ],
-                        ),
-                      ),
-                      Icon(
-                        Icons.arrow_forward_ios_rounded,
-                        size: isTablet ? 22 : 16,
-                        color: Colors.white.withValues(alpha: 0.6),
-                      ),
-                    ],
-                  ),
-                ),
-              ),
+          // Portrait: fixed above the list, exactly as before. Landscape: the
+          // banner lives inside the scrollable instead (see
+          // _buildLandscapeContent) so it scrolls away with the content.
+          if (!isLandscape) ...[
+            _buildEbookBanner(
+              isDark: isDark,
+              isTablet: isTablet,
+              scale: scale,
+              hPadding: hPadding,
+              compact: false,
             ),
-          ),
 
-          SizedBox(height: isTablet ? 21 : 16),
+            SizedBox(height: isTablet ? 21 : 16),
+          ],
 
           // Content
           Expanded(
-            child: _isLoading
-                ? Center(
-                    child: CircularProgressIndicator(color: iconColor),
+            child: isLandscape
+                ? _buildLandscapeContent(
+                    isDark: isDark,
+                    isTablet: isTablet,
+                    scale: scale,
+                    hPadding: hPadding,
+                    textColor: textColor,
+                    secondaryTextColor: secondaryTextColor,
+                    cardBgColor: cardBgColor,
+                    dividerColor: dividerColor,
+                    badgeColor: badgeColor,
+                    iconColor: iconColor,
+                    bottomInset: landscapeBottomInset,
                   )
-                : _error != null
+                : _isLoading
                     ? Center(
-                        child: Column(
-                          mainAxisAlignment: MainAxisAlignment.center,
-                          children: [
-                            Icon(Icons.error_outline, size: isTablet ? 64 : 48, color: secondaryTextColor),
-                            SizedBox(height: isTablet ? 21 : 16),
-                            Text(
-                              'Failed to load notes',
-                              style: TextStyle(
-                                fontFamily: 'Poppins',
-                                fontSize: isTablet ? 20 : 16,
-                                color: textColor,
-                              ),
-                            ),
-                            SizedBox(height: isTablet ? 10 : 8),
-                            Text(
-                              _error!.replaceAll('Exception: ', ''),
-                              style: TextStyle(
-                                fontFamily: 'Poppins',
-                                fontSize: isTablet ? 15 * scale : 12,
-                                color: secondaryTextColor,
-                              ),
-                              textAlign: TextAlign.center,
-                            ),
-                            SizedBox(height: isTablet ? 21 : 16),
-                            ElevatedButton(
-                              onPressed: _loadLibrary,
-                              style: ElevatedButton.styleFrom(backgroundColor: iconColor),
-                              child: const Text('Retry'),
-                            ),
-                          ],
-                        ),
+                        child: CircularProgressIndicator(color: iconColor),
+                      )
+                    : _error != null
+                    ? _buildErrorState(
+                        isTablet: isTablet,
+                        scale: scale,
+                        textColor: textColor,
+                        secondaryTextColor: secondaryTextColor,
+                        iconColor: iconColor,
                       )
                     : _filteredItems.isEmpty
-                        ? Center(
-                            child: Column(
-                              mainAxisAlignment: MainAxisAlignment.center,
-                              children: [
-                                Icon(
-                                  Icons.menu_book_outlined,
-                                  size: isTablet ? 80 : 64,
-                                  color: secondaryTextColor,
-                                ),
-                                SizedBox(height: isTablet ? 21 : 16),
-                                Text(
-                                  _showBookmarkedOnly
-                                      ? 'No bookmarked notes yet'
-                                      : 'No notes in your library',
-                                  style: TextStyle(
-                                    fontFamily: 'Poppins',
-                                    fontSize: isTablet ? 20 : 16,
-                                    fontWeight: FontWeight.w500,
-                                    color: textColor,
-                                  ),
-                                ),
-                                SizedBox(height: isTablet ? 10 : 8),
-                                Text(
-                                  'Add notes to your library from series',
-                                  style: TextStyle(
-                                    fontFamily: 'Poppins',
-                                    fontSize: isTablet ? 17 : 14,
-                                    color: secondaryTextColor,
-                                  ),
-                                ),
-                              ],
-                            ),
+                        ? _buildEmptyState(
+                            isTablet: isTablet,
+                            textColor: textColor,
+                            secondaryTextColor: secondaryTextColor,
                           )
                         : RefreshIndicator(
                             onRefresh: _loadLibrary,
                             child: isTablet
                               ? GridView.builder(
                                   physics: const AlwaysScrollableScrollPhysics(parent: ClampingScrollPhysics()),
+                                  // Clear the floating bottom nav (and mini player).
                                   padding: EdgeInsets.only(
                                     left: hPadding,
                                     right: hPadding,
-                                    bottom: 130,
+                                    bottom: landscapeBottomInset,
                                   ),
                                   gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
                                     crossAxisCount: 2,
@@ -651,7 +565,8 @@ class _YourNotesScreenState extends State<YourNotesScreen> {
                                 )
                               : ListView.builder(
                                   physics: const AlwaysScrollableScrollPhysics(parent: ClampingScrollPhysics()),
-                                  padding: const EdgeInsets.only(bottom: 100),
+                                  // Clear the floating bottom nav (and mini player).
+                                  padding: EdgeInsets.only(bottom: landscapeBottomInset),
                                   itemCount: _filteredItems.length,
                                   itemBuilder: (context, index) {
                                     final item = _filteredItems[index];
@@ -679,6 +594,330 @@ class _YourNotesScreenState extends State<YourNotesScreen> {
         ),
       ),
     );
+  }
+
+  /// Scroll-end clearance for the floating bottom nav bar in landscape.
+  ///
+  /// `AppScaffold` draws the nav bar as a Stack overlay
+  /// (`Positioned(bottom: padding.bottom + 12)`, height 88 on tablets / 70 on
+  /// phones, no `bottomNavigationBar`), so this screen's body is NOT shortened
+  /// by it and the list runs underneath. The scroll end therefore has to be
+  /// padded by the same geometry. When the mini player is showing it floats
+  /// 8dp above the nav bar (60dp tall), so that is added too. Never smaller
+  /// than the legacy fixed padding (130 tablet / 100 phone).
+  double _landscapeBottomInset(
+    BuildContext context, {
+    required bool isTablet,
+    required bool miniPlayerVisible,
+  }) {
+    // Keep in sync with AppScaffold (lib/core/widgets/app_scaffold.dart).
+    final navBarHeight = isTablet ? 88.0 : 70.0;
+    const navBottomMargin = 12.0;
+    const gapAboveNav = 16.0;
+    const miniPlayerBlock = 60.0 + 8.0; // MiniPlayerWidget height + its gap
+    final clearance = MediaQuery.of(context).padding.bottom +
+        navBottomMargin +
+        navBarHeight +
+        gapAboveNav +
+        (miniPlayerVisible ? miniPlayerBlock : 0.0);
+    return math.max(isTablet ? 130.0 : 100.0, clearance);
+  }
+
+  /// 'Buy E-Books' (iOS: 'E-Books') banner.
+  ///
+  /// [compact] false = the original fixed-height banner (portrait). [compact]
+  /// true = the same banner sized to its content instead of the fixed
+  /// `orderBookCardHeight` (landscape, where it lives inside the scrollable).
+  Widget _buildEbookBanner({
+    required bool isDark,
+    required bool isTablet,
+    required double scale,
+    required double hPadding,
+    required bool compact,
+  }) {
+    return Padding(
+      padding: EdgeInsets.symmetric(horizontal: isTablet ? hPadding : 15),
+      child: GestureDetector(
+        onTap: () => context.push('/ebook-store'),
+        child: Container(
+          width: double.infinity,
+          height: compact ? null : ResponsiveHelper.orderBookCardHeight(context),
+          decoration: BoxDecoration(
+            borderRadius: BorderRadius.circular(isTablet ? 24 : 14),
+            gradient: LinearGradient(
+              begin: Alignment.topLeft,
+              end: Alignment.bottomRight,
+              colors: isDark
+                  ? [const Color(0xFF1A3A2E), const Color(0xFF0D2A1C)]
+                  : [const Color(0xFF00875A), const Color(0xFF00C853)],
+            ),
+          ),
+          child: Padding(
+            padding: EdgeInsets.symmetric(
+              horizontal: isTablet ? 24 : 16,
+              vertical: isTablet ? 20 : 14,
+            ),
+            child: Row(
+              children: [
+                Container(
+                  width: isTablet ? 52 : 40,
+                  height: isTablet ? 52 : 40,
+                  decoration: BoxDecoration(
+                    color: Colors.white.withValues(alpha: 0.2),
+                    borderRadius: BorderRadius.circular(isTablet ? 14 : 10),
+                  ),
+                  child: Icon(
+                    Icons.menu_book_rounded,
+                    size: isTablet ? 28 : 22,
+                    color: Colors.white,
+                  ),
+                ),
+                SizedBox(width: isTablet ? 16 : 12),
+                Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    mainAxisAlignment: MainAxisAlignment.center,
+                    // Content-sized when compact (unbounded height inside the
+                    // scrollable); fills the fixed-height banner otherwise.
+                    mainAxisSize: compact ? MainAxisSize.min : MainAxisSize.max,
+                    children: [
+                      Text(
+                        Platform.isIOS ? 'E-Books' : 'Buy E-Books',
+                        style: TextStyle(
+                          fontFamily: 'Poppins',
+                          fontWeight: FontWeight.w600,
+                          fontSize: isTablet ? 22 * scale : 16,
+                          color: Colors.white,
+                        ),
+                      ),
+                      SizedBox(height: isTablet ? 4 : 2),
+                      Text(
+                        Platform.isIOS ? 'Browse study materials' : 'Browse and purchase study materials',
+                        style: TextStyle(
+                          fontFamily: 'Poppins',
+                          fontWeight: FontWeight.w400,
+                          fontSize: isTablet ? 15 * scale : 12,
+                          color: Colors.white.withValues(alpha: 0.7),
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+                Icon(
+                  Icons.arrow_forward_ios_rounded,
+                  size: isTablet ? 22 : 16,
+                  color: Colors.white.withValues(alpha: 0.6),
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  /// 'Failed to load notes' state (shared by portrait and landscape).
+  Widget _buildErrorState({
+    required bool isTablet,
+    required double scale,
+    required Color textColor,
+    required Color secondaryTextColor,
+    required Color iconColor,
+  }) {
+    return Center(
+      child: Column(
+        mainAxisAlignment: MainAxisAlignment.center,
+        children: [
+          Icon(Icons.error_outline, size: isTablet ? 64 : 48, color: secondaryTextColor),
+          SizedBox(height: isTablet ? 21 : 16),
+          Text(
+            'Failed to load notes',
+            style: TextStyle(
+              fontFamily: 'Poppins',
+              fontSize: isTablet ? 20 : 16,
+              color: textColor,
+            ),
+          ),
+          SizedBox(height: isTablet ? 10 : 8),
+          Text(
+            _error!.replaceAll('Exception: ', ''),
+            style: TextStyle(
+              fontFamily: 'Poppins',
+              fontSize: isTablet ? 15 * scale : 12,
+              color: secondaryTextColor,
+            ),
+            textAlign: TextAlign.center,
+          ),
+          SizedBox(height: isTablet ? 21 : 16),
+          ElevatedButton(
+            onPressed: _loadLibrary,
+            style: ElevatedButton.styleFrom(backgroundColor: iconColor),
+            child: const Text('Retry'),
+          ),
+        ],
+      ),
+    );
+  }
+
+  /// 'No notes in your library' state (shared by portrait and landscape).
+  Widget _buildEmptyState({
+    required bool isTablet,
+    required Color textColor,
+    required Color secondaryTextColor,
+  }) {
+    return Center(
+      child: Column(
+        mainAxisAlignment: MainAxisAlignment.center,
+        children: [
+          Icon(
+            Icons.menu_book_outlined,
+            size: isTablet ? 80 : 64,
+            color: secondaryTextColor,
+          ),
+          SizedBox(height: isTablet ? 21 : 16),
+          Text(
+            _showBookmarkedOnly
+                ? 'No bookmarked notes yet'
+                : 'No notes in your library',
+            style: TextStyle(
+              fontFamily: 'Poppins',
+              fontSize: isTablet ? 20 : 16,
+              fontWeight: FontWeight.w500,
+              color: textColor,
+            ),
+          ),
+          SizedBox(height: isTablet ? 10 : 8),
+          Text(
+            'Add notes to your library from series',
+            style: TextStyle(
+              fontFamily: 'Poppins',
+              fontSize: isTablet ? 17 : 14,
+              color: secondaryTextColor,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  /// Landscape content area: ONE scroll view holding the (compact) E-Books
+  /// banner followed by the state-specific content, so the banner scrolls away
+  /// with the list instead of permanently eating ~27% of the screen height.
+  ///
+  /// Constraint notes: the parent is an `Expanded` (bounded height). The
+  /// loading / error / empty states use `SliverFillRemaining(hasScrollBody:
+  /// false)`, which centres the child in the space left under the banner and
+  /// lets the whole thing scroll if it is ever taller than that, so nothing
+  /// can overflow. The list/grid slivers end with [bottomInset] of padding so
+  /// the last row can be scrolled clear of the floating nav bar.
+  Widget _buildLandscapeContent({
+    required bool isDark,
+    required bool isTablet,
+    required double scale,
+    required double hPadding,
+    required Color textColor,
+    required Color secondaryTextColor,
+    required Color cardBgColor,
+    required Color dividerColor,
+    required Color badgeColor,
+    required Color iconColor,
+    required double bottomInset,
+  }) {
+    final items = _filteredItems;
+    final showList = !_isLoading && _error == null && items.isNotEmpty;
+
+    // Centre non-list states in the area ABOVE the nav bar, not behind it.
+    Widget stateSliver(Widget child) => SliverFillRemaining(
+          hasScrollBody: false,
+          child: Padding(
+            padding: EdgeInsets.only(bottom: bottomInset),
+            child: child,
+          ),
+        );
+
+    Widget bookCard(LibraryItemModel item, double cardHPadding) => _buildBookCard(
+          item: item,
+          isDark: isDark,
+          isTablet: isTablet,
+          textColor: textColor,
+          secondaryTextColor: secondaryTextColor,
+          cardBgColor: cardBgColor,
+          dividerColor: dividerColor,
+          badgeColor: badgeColor,
+          iconColor: iconColor,
+          hPadding: cardHPadding,
+        );
+
+    final scrollView = CustomScrollView(
+      physics: const AlwaysScrollableScrollPhysics(parent: ClampingScrollPhysics()),
+      slivers: [
+        // E-Books banner: compact, and part of the scrollable.
+        SliverToBoxAdapter(
+          child: Padding(
+            padding: EdgeInsets.only(bottom: isTablet ? 21 : 16),
+            child: _buildEbookBanner(
+              isDark: isDark,
+              isTablet: isTablet,
+              scale: scale,
+              hPadding: hPadding,
+              compact: true,
+            ),
+          ),
+        ),
+
+        if (_isLoading)
+          stateSliver(Center(child: CircularProgressIndicator(color: iconColor)))
+        else if (_error != null)
+          stateSliver(_buildErrorState(
+            isTablet: isTablet,
+            scale: scale,
+            textColor: textColor,
+            secondaryTextColor: secondaryTextColor,
+            iconColor: iconColor,
+          ))
+        else if (items.isEmpty)
+          stateSliver(_buildEmptyState(
+            isTablet: isTablet,
+            textColor: textColor,
+            secondaryTextColor: secondaryTextColor,
+          ))
+        else ...[
+          if (isTablet)
+            SliverPadding(
+              padding: EdgeInsets.only(left: hPadding, right: hPadding),
+              sliver: SliverGrid(
+                gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
+                  crossAxisCount: 2,
+                  crossAxisSpacing: 16,
+                  mainAxisSpacing: 16,
+                  childAspectRatio: 16 / 9,
+                ),
+                delegate: SliverChildBuilderDelegate(
+                  (context, index) => bookCard(items[index], 0),
+                  childCount: items.length,
+                ),
+              ),
+            )
+          else
+            SliverList(
+              delegate: SliverChildBuilderDelegate(
+                (context, index) => Padding(
+                  padding: const EdgeInsets.only(bottom: 12),
+                  child: bookCard(items[index], hPadding),
+                ),
+                childCount: items.length,
+              ),
+            ),
+          // Scroll-end clearance so the last row is never behind the nav bar.
+          SliverToBoxAdapter(child: SizedBox(height: bottomInset)),
+        ],
+      ],
+    );
+
+    // Pull-to-refresh only on the list state, exactly as in portrait.
+    return showList
+        ? RefreshIndicator(onRefresh: _loadLibrary, child: scrollView)
+        : scrollView;
   }
 
   Widget _buildBookCard({

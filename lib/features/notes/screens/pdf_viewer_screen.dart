@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:io';
+import 'dart:isolate';
 import 'package:dio/dio.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -7,6 +8,7 @@ import 'package:go_router/go_router.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:provider/provider.dart';
 import 'package:syncfusion_flutter_pdfviewer/pdfviewer.dart';
+import 'package:syncfusion_flutter_pdf/pdf.dart' as sfpdf;
 import 'package:pgme/core/constants/api_constants.dart';
 import 'package:pgme/core/providers/theme_provider.dart';
 import 'package:pgme/core/services/api_service.dart';
@@ -16,6 +18,7 @@ import 'package:pgme/core/services/download_service.dart';
 import 'package:pgme/core/services/progress_service.dart';
 import 'package:pgme/core/theme/app_theme.dart';
 import 'package:pgme/core/utils/responsive_helper.dart';
+import 'package:pgme/core/utils/highlight_placement.dart';
 import 'package:wakelock_plus/wakelock_plus.dart';
 import 'package:pgme/core/widgets/app_dialog.dart';
 import 'package:pgme/core/providers/mini_player_provider.dart';
@@ -406,13 +409,62 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> {
       } catch (e) {
         debugPrint('[BOOKMARK] Failed: $e');
         if (mounted) {
-          showAppDialog(context, message: 'Failed to add bookmark', type: AppDialogType.info);
+          showAppDialog(context,
+              message: e.toString().replaceFirst('Exception: ', '').trim().isEmpty
+                  ? 'Failed to add bookmark'
+                  : e.toString().replaceFirst('Exception: ', '').trim(),
+              type: AppDialogType.info);
         }
       }
     }
   }
 
   // ── Highlights & Underlines ───────────────────────────────────────
+
+  /// Page height in points for a 1-based page number; set when the document
+  /// has loaded. Used only to convert legacy y-up highlight rows.
+  double Function(int pageNumber)? _pageHeightOf;
+
+  /// The loaded document (set in onDocumentLoaded). Used to read page text so
+  /// saved highlights can be placed on the words they were made on.
+  sfpdf.PdfDocument? _sfDocument;
+
+  /// Text lines (top-left origin) of every page that has a saved highlight,
+  /// keyed by 1-based page number. Extraction runs on a background isolate
+  /// (it costs tens of ms per page), so it never stalls scrolling.
+  Future<Map<int, List<PageTextBox>>> _loadPageTextForRows(
+      List<dynamic> rows) async {
+    final path = _localPath;
+    final pageCount = _sfDocument?.pages.count ?? 0;
+    final result = <int, List<PageTextBox>>{};
+    if (path == null || pageCount == 0) return result;
+    final pages = <int>{};
+    for (final h in rows) {
+      final bounds = (h is Map) ? h['bounds_data'] : null;
+      if (bounds is! List) continue;
+      for (final b in bounds) {
+        final p = (b is Map) ? (b['page_number'] as num?)?.toInt() : null;
+        if (p != null && p >= 1 && p <= pageCount) pages.add(p);
+      }
+    }
+    if (pages.isEmpty) return result;
+    try {
+      final raw = await _extractPageLinesInBackground(path, pages.toList());
+      raw.forEach((page, lines) {
+        result[page] = [
+          for (final l in lines)
+            PageTextBox(
+              Rect.fromLTRB(l[0] as double, l[1] as double, l[2] as double,
+                  l[3] as double),
+              l[4] as String,
+            ),
+        ];
+      });
+    } catch (e) {
+      debugPrint('[PDF] page text unavailable for highlight placement: $e');
+    }
+    return result;
+  }
 
   /// Load saved highlights/underlines from backend and apply as annotations
   Future<void> _loadHighlights() async {
@@ -426,6 +478,11 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> {
     try {
       final highlights =
           await _highlightService.getHighlights(widget.documentId!);
+
+      // Text of every page that has a saved highlight, so each row can be
+      // placed by the words it was made on (see HighlightPlacement).
+      final pageText = await _loadPageTextForRows(highlights);
+      if (!mounted) return;
 
       for (final h in highlights) {
         try {
@@ -449,17 +506,36 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> {
 
           if (boundsData == null || boundsData.isEmpty) continue;
 
+          // Bounds are top-left / y-down; rows saved by older pdfrx builds
+          // are PDF-native y-up. Pick the placement that lands on the row's
+          // own text and flip those that need it.
+          final legacyYUp = _pageHeightOf != null &&
+              HighlightPlacement.isYUp(
+                bounds: boundsData.cast<Map<String, dynamic>>(),
+                pageHeight: (p) {
+                  final count = _sfDocument?.pages.count ?? 0;
+                  if (p < 1 || p > count) return null;
+                  return _pageHeightOf!(p);
+                },
+                pageText: (p) => pageText[p],
+                startOffset: (h['start_offset'] as num?)?.toInt(),
+              );
+
           // Reconstruct PdfTextLine objects from saved bounds
           final textLines = boundsData.map<PdfTextLine>((b) {
+            final pageNumber = (b['page_number'] as num).toInt();
+            final rawTop = (b['top'] as num).toDouble();
+            final top =
+                legacyYUp ? _pageHeightOf!(pageNumber) - rawTop : rawTop;
             return PdfTextLine(
               Rect.fromLTWH(
                 (b['left'] as num).toDouble(),
-                (b['top'] as num).toDouble(),
+                top,
                 (b['width'] as num).toDouble(),
                 (b['height'] as num).toDouble(),
               ),
               b['text'] as String? ?? '',
-              (b['page_number'] as num).toInt(),
+              pageNumber,
             );
           }).toList();
 
@@ -2680,6 +2756,11 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> {
             _isPdfReady = true;
           });
         }
+        // Lets _loadHighlights flip legacy (y-up) rows written by older pdfrx
+        // builds into this viewer's top-left coordinate space.
+        _pageHeightOf = (int pageNumber) =>
+            details.document.pages[pageNumber - 1].size.height;
+        _sfDocument = details.document;
         _loadHighlights();
         _loadBookmarks();
         _restoreProgress();
@@ -3157,5 +3238,36 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> {
         ],
       ),
     );
+  }
+}
+
+/// Runs [_extractPageLines] on a background isolate. Defined at top level so
+/// the closure captures only the path and page list (both sendable).
+Future<Map<int, List<List<Object>>>> _extractPageLinesInBackground(
+        String path, List<int> pages) =>
+    Isolate.run(() => _extractPageLines(path, pages));
+
+/// Text lines of [pages] (1-based) as [left, top, right, bottom, text] in
+/// page points, top-left origin. Pure Dart; safe to run off the UI isolate.
+Map<int, List<List<Object>>> _extractPageLines(String path, List<int> pages) {
+  final doc = sfpdf.PdfDocument(inputBytes: File(path).readAsBytesSync());
+  try {
+    final extractor = sfpdf.PdfTextExtractor(doc);
+    final out = <int, List<List<Object>>>{};
+    for (final p in pages) {
+      try {
+        final lines =
+            extractor.extractTextLines(startPageIndex: p - 1, endPageIndex: p - 1);
+        out[p] = [
+          for (final l in lines)
+            [l.bounds.left, l.bounds.top, l.bounds.right, l.bounds.bottom, l.text],
+        ];
+      } catch (_) {
+        // Page without extractable text: placement falls back for its rows.
+      }
+    }
+    return out;
+  } finally {
+    doc.dispose();
   }
 }

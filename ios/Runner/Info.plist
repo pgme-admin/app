@@ -109,5 +109,7 @@
 		<string>UIInterfaceOrientationLandscapeLeft</string>
 		<string>UIInterfaceOrientationLandscapeRight</string>
 	</array>
+	<key>PGMEAllowScreenCapture</key>
+	<string>$(PGME_ALLOW_SCREEN_CAPTURE)</string>
 </dict>
 </plist>

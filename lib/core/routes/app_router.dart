@@ -48,7 +48,7 @@ import 'package:pgme/features/settings/screens/terms_and_conditions_screen.dart'
 import 'package:pgme/features/settings/screens/privacy_policy_screen.dart';
 import 'package:pgme/features/settings/screens/refund_policy_screen.dart';
 import 'package:pgme/features/settings/screens/downloads_screen.dart';
-import 'package:pgme/features/notes/screens/pdf_viewer_screen.dart';
+import 'package:pgme/core/utils/pdf_engine_policy.dart';
 import 'package:pgme/features/notes/screens/epub_viewer_screen.dart';
 import 'package:pgme/features/auth/screens/map_address_picker_screen.dart';
 import 'package:provider/provider.dart';
@@ -720,7 +720,7 @@ class AppRouter {
               final title = state.uri.queryParameters['title'] ?? 'PDF Viewer';
               return CustomTransitionPage(
                 key: state.pageKey,
-                child: PdfViewerScreen(documentId: documentId, pdfUrl: pdfUrl, title: title),
+                child: PdfEnginePolicy.buildReader(documentId: documentId, pdfUrl: pdfUrl, title: title),
                 transitionsBuilder: (context, animation, secondaryAnimation, child) {
                   return SlideTransition(
                     position: Tween<Offset>(
