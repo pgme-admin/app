@@ -1083,11 +1083,45 @@ class _PdfPageTextPdfium extends PdfPageText {
     return sb.toString();
   }
 
+  /// PGME patch: gives every text line room for descenders below its baseline.
+  ///
+  /// Character boxes follow each glyph's ink, so a line's box ended at the
+  /// baseline when it had no descenders (g, p, y...) and at the descender tips
+  /// when it had them. Underlines drawn at the box bottom therefore cut
+  /// through letters on some lines and sat well below on others, and
+  /// highlights changed height from line to line.
+  ///
+  /// The baseline is where most glyphs end (the median bottom; descenders are
+  /// a minority). The box is extended down to 0.32 x the ascent below it,
+  /// about a typical descender depth. It is never shrunk, so lines that
+  /// already reach lower (descenders, rotated text) are unchanged.
+  ///
+  /// PDFium's FPDFText_GetLooseCharBox was tried for this and rejected: it
+  /// follows the font's declared ascent/descent, which some PDFs get badly
+  /// wrong (2.7 em tall for the Times New Roman in the PGME books), so line
+  /// boxes overlapped and selections jumped to the neighbouring line.
+  static PdfRect _withDescenderSpace(PdfRect line, List<PdfRect> rects, int start, int end, String str) {
+    final bottoms = <double>[];
+    for (int i = start; i < end; i++) {
+      if (str.codeUnitAt(i) == _charSpace) continue;
+      final r = rects[i];
+      if (r.top > r.bottom) bottoms.add(r.bottom);
+    }
+    if (bottoms.isEmpty) return line;
+    bottoms.sort();
+    final baseline = bottoms[bottoms.length ~/ 2];
+    final ascent = line.top - baseline;
+    if (ascent <= 0) return line;
+    final descenderBottom = baseline - ascent * 0.32;
+    if (descenderBottom >= line.bottom) return line;
+    return PdfRect(line.left, line.top, line.right, descenderBottom);
+  }
+
   /// return true if any meaningful characters in the line (start -> end)
   static bool _makeLineFlat(List<PdfRect> rects, int start, int end, StringBuffer sb) {
     if (start >= end) return false;
     final str = sb.toString();
-    final bounds = rects.skip(start).take(end - start).boundingRect();
+    final bounds = _withDescenderSpace(rects.skip(start).take(end - start).boundingRect(), rects, start, end, str);
     double? prev;
     for (int i = start; i < end; i++) {
       final rect = rects[i];

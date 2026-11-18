@@ -44,6 +44,34 @@ class HighlightPlacement {
     return startOffset == 0;
   }
 
+  /// Stretches a saved line rectangle (top-left origin) vertically to the
+  /// text line it sits on, keeping its left/right edges. [lines] are the
+  /// page's text boxes in the same coordinates.
+  ///
+  /// Older rows were saved from each glyph's ink box, whose bottom is the
+  /// baseline on lines without descenders and the descender tip on lines
+  /// with them. Snapping gives old rows the same line band new annotations
+  /// use, so their highlights and underlines line up too. Returns [rect]
+  /// unchanged when no text line matches.
+  static Rect snapToTextLine(Rect rect, List<PageTextBox> lines) {
+    double? top;
+    double? bottom;
+    for (final line in lines) {
+      final overlap = rect.intersect(line.rect);
+      if (overlap.width <= 0 || overlap.height <= 0) continue;
+      // Same rule as _score: share most of the line's height, not graze it.
+      if (overlap.height < 0.5 * math.min(rect.height, line.rect.height)) {
+        continue;
+      }
+      top = top == null ? line.rect.top : math.min(top, line.rect.top);
+      bottom = bottom == null
+          ? line.rect.bottom
+          : math.max(bottom, line.rect.bottom);
+    }
+    if (top == null || bottom == null) return rect;
+    return Rect.fromLTRB(rect.left, top, rect.right, bottom);
+  }
+
   static String _normalize(String s) =>
       s.toLowerCase().replaceAll(RegExp(r'[^a-z0-9]'), '');
 

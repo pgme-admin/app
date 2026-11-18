@@ -707,6 +707,7 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> {
                   (b) => AnnotationTextBounds.fromJson(b as Map<String, dynamic>))
               .map<AnnotationTextBounds>(
                   (b) => legacyYUp ? _legacyYUpToYDown(b) : b)
+              .map<AnnotationTextBounds>((b) => _snapToTextLine(b, pageText))
               .toList();
 
           final data = _AnnotationData(
@@ -799,6 +800,25 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> {
     );
   }
 
+  /// Gives a saved line the same top/bottom as the text line it covers (see
+  /// HighlightPlacement.snapToTextLine). Display only; the stored row is not
+  /// changed.
+  AnnotationTextBounds _snapToTextLine(
+      AnnotationTextBounds b, Map<int, List<PageTextBox>> pageText) {
+    final lines = pageText[b.pageNumber];
+    if (lines == null || lines.isEmpty) return b;
+    final r = HighlightPlacement.snapToTextLine(b.toRect(), lines);
+    if (r.top == b.top && r.height == b.height) return b;
+    return AnnotationTextBounds(
+      left: b.left,
+      top: r.top,
+      width: b.width,
+      height: r.height,
+      text: b.text,
+      pageNumber: b.pageNumber,
+    );
+  }
+
   Rect _boundsToScreenRect(
       AnnotationTextBounds bounds, PdfPage page, Rect pageRect) {
     // Stored bounds are top-left / y-down. Flip to pdfrx's PDF page space
@@ -820,7 +840,9 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> {
   void _paintAnnotations(Canvas canvas, Rect pageRect, PdfPage page) {
     final pageNumber = page.pageNumber;
 
-    // Paint highlights
+    // Paint highlights. Multiply tints the paper like a highlighter pen and
+    // leaves the text black; plain alpha painting laid the colour over the
+    // letters too and turned them a washed-out olive.
     for (final entry in _highlights.entries) {
       for (final bounds in entry.value.bounds) {
         if (bounds.pageNumber != pageNumber) continue;
@@ -829,23 +851,29 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> {
           rect,
           Paint()
             ..color = entry.value.color
+            ..blendMode = BlendMode.multiply
             ..style = PaintingStyle.fill,
         );
       }
     }
 
-    // Paint underlines
+    // Paint underlines. A line's box runs from the top of its tallest letters
+    // to descender depth (vendor/pdfrx _withDescenderSpace), with the baseline
+    // about a quarter of the way up from the bottom. The stroke goes just
+    // under the baseline, as in a word processor, on every line alike, and
+    // its thickness follows the text size.
     for (final entry in _underlines.entries) {
       for (final bounds in entry.value.bounds) {
         if (bounds.pageNumber != pageNumber) continue;
         final rect = _boundsToScreenRect(bounds, page, pageRect);
+        final y = rect.bottom - rect.height * 0.12;
         canvas.drawLine(
-          Offset(rect.left, rect.bottom),
-          Offset(rect.right, rect.bottom),
+          Offset(rect.left, y),
+          Offset(rect.right, y),
           Paint()
             ..color = underlineColor
             ..style = PaintingStyle.stroke
-            ..strokeWidth = 2.0,
+            ..strokeWidth = (rect.height * 0.06).clamp(0.5, 4.0),
         );
       }
     }
@@ -1295,7 +1323,13 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> {
         final aBottom = lineA.top + lineA.height;
         final bTop = lineB.top;
         final bBottom = lineB.top + lineB.height;
-        if (aLeft < bRight && aRight > bLeft && aTop < bBottom && aBottom > bTop) {
+        // Line boxes now include descender space, so neighbouring lines can
+        // touch; require most of a line's height in common, not a graze.
+        final sharedHeight =
+            math.min(aBottom, bBottom) - math.max(aTop, bTop);
+        if (aLeft < bRight &&
+            aRight > bLeft &&
+            sharedHeight > 0.5 * math.min(lineA.height, lineB.height)) {
           return true;
         }
       }
@@ -3301,12 +3335,32 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> {
         // viewer is in dark mode and the page hasn't rendered yet) doesn't
         // flash grey. Default is Colors.grey.
         backgroundColor: Colors.transparent,
-        // Initial zoom = coverZoom -> page fills viewport WIDTH (overflowing
-        // vertically, which is desired for vertical scrolling). pdfrx
-        // default is fitZoom which leaves left/right whitespace because the
-        // entire page is fitted into the viewport.
-        calculateInitialZoom:
-            (document, controller, fitZoom, coverZoom) => coverZoom,
+        // Full-screen reader opens on one whole page (fitZoom = the entire
+        // page inside the view). Filling the width instead (coverZoom) cut
+        // the page off wherever the view is wider than a page's shape, i.e.
+        // tablets, landscape and short phones, so the book opened zoomed in
+        // and readers had to pinch out every time. On tall phones both are
+        // the same. The pane beside a video keeps filling its width.
+        calculateInitialZoom: (document, controller, fitZoom, coverZoom) =>
+            widget.embedded ? coverZoom : fitZoom,
+        // Rotating keeps pdfrx's zoom, which would cut the page off again
+        // (portrait -> landscape) or leave it small. Re-fit the current page
+        // when the orientation flips; other resizes (keyboard) are left alone.
+        onViewSizeChanged: (viewSize, oldViewSize, controller) {
+          if (widget.embedded || oldViewSize == null) return;
+          final wasLandscape = oldViewSize.width > oldViewSize.height;
+          final isLandscape = viewSize.width > viewSize.height;
+          if (wasLandscape == isLandscape) return;
+          // Not during build (see PdfViewerParams.onViewSizeChanged); after
+          // pdfrx's own post-resize page jump.
+          Future.delayed(const Duration(milliseconds: 250), () {
+            if (!mounted || !controller.isReady) return;
+            final page = controller.pageNumber ?? _currentPage.value;
+            if (page < 1 || page > controller.pageCount) return;
+            controller.goTo(controller.calcMatrixForFit(pageNumber: page),
+                duration: Duration.zero);
+          });
+        },
         // Cap the rendered-page bitmap cache. pdfrx default is 100MB which
         // is too generous for mid-tier Android tablets where the per-app heap
         // is 256-384MB. 50MB holds 8-12 page bitmaps at typical sizes —
