@@ -14,24 +14,30 @@ import 'package:pgme/features/notes/screens/pdf_viewer_screen_pdfrx.dart'
 /// Decides which PDF engine renders a standalone PDF reader.
 ///
 /// Policy:
-///  * Android with API level below 35, or Android whose version could not be
-///    determined  ->  pdfrx. The Syncfusion viewer is slow and memory-hungry
-///    on old devices, and the native androidx.pdf viewer needs Android 15
-///    (API 35), so pdfrx is the engine that old devices always get.
-///  * iOS  ->  pdfrx. Measured on a 1,502-page book, Syncfusion did ~3x the
-///    per-frame work of pdfrx while scrolling (spikes 39 ms vs 7 ms), froze
-///    ~0.25 s on open and used several times more memory; pdfrx renders with
-///    PDFium off the UI thread and is already the split-pane reader on iOS.
-///  * Every other case (Android 35+, anything else)  ->  the existing
-///    Syncfusion reader, unchanged.
+///  * iOS and every Android version  ->  pdfrx.
+///    - Measured on a 1,502-page book, Syncfusion did ~3x the per-frame work
+///      of pdfrx while scrolling (spikes 39 ms vs 7 ms), froze ~0.25 s on open
+///      and used several times more memory (~3.7 GB peak vs ~0.8 GB); pdfrx
+///      renders with PDFium off the UI thread.
+///    - The ebook fixes the client asked for (Nov 2026) exist only in the
+///      pdfrx reader and cannot be made in Syncfusion: opening on one whole
+///      page (Syncfusion's scrolling mode always fills the width), highlights
+///      that leave the text black (Syncfusion paints its own translucent
+///      layer over the words), aligned underlines, the colour menu next to
+///      the selection and clearing the selection after an annotation.
+///    - Android 15+ used to keep Syncfusion, reserved for a native
+///      androidx.pdf viewer that was never merged into this codebase.
+///  * Anything else (no such builds today)  ->  the Syncfusion reader.
 ///
-/// Call [init] once at startup. It never throws. If it never ran (or has not
-/// finished yet) the getters stay safe: Android falls back to pdfrx, iOS uses
-/// pdfrx, other platforms keep Syncfusion.
+/// [androidSdkInt] is still read at startup: [nativeViewerMinSdk] marks where
+/// a native Android viewer would plug in, should one be added.
+///
+/// Call [init] once at startup. It never throws.
 class PdfEnginePolicy {
   PdfEnginePolicy._();
 
-  /// First Android API level with the native PDF viewer (Android 15).
+  /// First Android API level with the platform PDF viewer (androidx.pdf,
+  /// Android 15). Not used for the decision today; see the class comment.
   static const int nativeViewerMinSdk = 35;
 
   static int? _androidSdkInt;
@@ -50,7 +56,7 @@ class PdfEnginePolicy {
           .timeout(const Duration(seconds: 3));
       _androidSdkInt = info.version.sdkInt;
     } catch (e) {
-      // Leave the API level unknown: on Android that selects pdfrx.
+      // Leave the API level unknown; the engine choice does not depend on it.
       debugPrint('PdfEnginePolicy: could not read Android SDK level: $e');
     }
   }
@@ -62,10 +68,7 @@ class PdfEnginePolicy {
     required int? androidSdkInt,
     bool isIOS = false,
   }) {
-    if (isIOS) return true;
-    if (!isAndroid) return false;
-    if (androidSdkInt == null) return true;
-    return androidSdkInt < nativeViewerMinSdk;
+    return isIOS || isAndroid;
   }
 
   /// True when standalone PDF readers must use pdfrx instead of Syncfusion.
