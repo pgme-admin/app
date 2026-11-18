@@ -1,0 +1,87 @@
+group = "com.simitgroup.flutter_zoom_meeting_sdk"
+version = "1.0-SNAPSHOT"
+
+buildscript {
+    ext.kotlin_version = "1.8.22"
+    repositories {
+        google()
+        mavenCentral()
+    }
+
+    dependencies {
+        classpath("com.android.tools.build:gradle:8.7.0")
+        classpath("org.jetbrains.kotlin:kotlin-gradle-plugin:$kotlin_version")
+    }
+}
+
+allprojects {
+    repositories {
+        google()
+        mavenCentral()
+    }
+}
+
+// PGME: the upstream plugin added jcenter() + a flatDir pointing at libs/ to
+// every project here so the app could find libs/mobilertc.aar. The SDK now
+// comes from Maven Central (see the dependencies block below), so that is gone.
+
+apply plugin: "com.android.library"
+apply plugin: "kotlin-android"
+
+android {
+    namespace = "com.simitgroup.flutter_zoom_meeting_sdk"
+
+    compileSdk = 35
+
+    compileOptions {
+        sourceCompatibility = JavaVersion.VERSION_17
+        targetCompatibility = JavaVersion.VERSION_17
+        coreLibraryDesugaringEnabled true
+    }
+
+    kotlinOptions {
+        jvmTarget = JavaVersion.VERSION_17
+    }
+
+    sourceSets {
+        main.java.srcDirs += "src/main/kotlin"
+        test.java.srcDirs += "src/test/kotlin"
+    }
+
+    defaultConfig {
+        minSdk = 26
+    }
+
+    dependencies {
+        testImplementation("org.jetbrains.kotlin:kotlin-test")
+        testImplementation("org.mockito:mockito-core:5.0.0")
+    }
+
+    testOptions {
+        unitTests.all {
+            useJUnitPlatform()
+
+            testLogging {
+               events "passed", "skipped", "failed", "standardOut", "standardError"
+               outputs.upToDateWhen {false}
+               showStandardStreams = true
+            }
+        }
+    }
+}
+
+// PGME: Zoom Meeting SDK for Android from Maven Central, published by Zoom
+// (us.zoom.meetingsdk:zoomsdk, developer "Zoom Communications, Inc.", PGP
+// signed). Pinned to 6.4.3 to match the iOS SDK (6.4.3.23800) the app ships.
+// Its POM declares the SDK's own dependencies, so the upstream
+// libs/mobilertc.aar + libs/build.gradle (sdkDependenciesList) setup is not
+// needed; that aar is 275 MB, over GitHub's file limit, so it could not be
+// committed anyway. Zoom enforces a minimum SDK version quarterly (6.0.2 as of
+// Nov 2026): bump this, together with the iOS SDK, when Zoom raises it.
+ext.zoomMeetingSdkVersion = "6.4.3"
+
+dependencies {
+    implementation "us.zoom.meetingsdk:zoomsdk:${zoomMeetingSdkVersion}"
+
+    coreLibraryDesugaring "com.android.tools:desugar_jdk_libs:2.0.4"
+}

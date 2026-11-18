@@ -56,7 +56,21 @@ android/key.properties
 android/upload-keystore.jks
 android/play-service-account.json
 
-packages
+# Zoom Meeting SDK plugin: the plugin's own code is tracked (it carries PGME
+# changes: Android SDK from Maven Central, safe uninitialize, iOS search
+# paths). Zoom's proprietary SDK binaries are NOT committed (this repository is
+# public, and the big ones exceed GitHub's 100 MB limit); see
+# packages/flutter_zoom_meeting_sdk/PGME.md for where they come from.
+packages/*
+!packages/flutter_zoom_meeting_sdk/
+!packages/flutter_zoom_meeting_sdk/*.md
+packages/flutter_zoom_meeting_sdk/example/
+packages/flutter_zoom_meeting_sdk/ios/zoomcml.xcframework/
+packages/flutter_zoom_meeting_sdk/android/libs/
+packages/flutter_zoom_meeting_sdk/**/build/
+packages/flutter_zoom_meeting_sdk/.dart_tool/
+packages/flutter_zoom_meeting_sdk/.flutter-plugins*
+packages/flutter_zoom_meeting_sdk/pubspec.lock
 .claude/settings.local.json
 packages.zip
 
