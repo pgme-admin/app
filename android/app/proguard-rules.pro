@@ -108,3 +108,20 @@
 -dontwarn javax.lang.model.**
 -dontwarn us.zoom.intunelib.**
 -dontwarn us.zoom.thirdparty.**
+
+# Zoom SDK from Maven Central (us.zoom.meetingsdk:zoomsdk). Its POM pulls in
+# kotlinx-coroutines-swing, a desktop library whose Swing/AWT classes do not
+# exist on Android; nothing on Android ever loads it (the line above keeps all
+# of kotlinx.coroutines, so R8 sees its references). Exactly the classes R8
+# reported missing.
+-dontwarn java.awt.event.ActionEvent
+-dontwarn java.awt.event.ActionListener
+-dontwarn javax.swing.SwingUtilities
+-dontwarn javax.swing.Timer
+
+# OkHttp's optional TLS providers. OkHttp uses them only when one is installed
+# as the JVM security provider, which never happens on Android (OkHttp's own
+# documented rules).
+-dontwarn org.bouncycastle.jsse.**
+-dontwarn org.conscrypt.**
+-dontwarn org.openjsse.**

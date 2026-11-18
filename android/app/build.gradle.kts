@@ -27,10 +27,6 @@ android {
         isCoreLibraryDesugaringEnabled = true
     }
 
-    kotlinOptions {
-        jvmTarget = JavaVersion.VERSION_17.toString()
-    }
-
     defaultConfig {
         // TODO: Specify your own unique Application ID (https://developer.android.com/studio/build/application-id.html).
         applicationId = "com.pgme.app"
@@ -134,6 +130,14 @@ if (!keystorePropertiesFile.exists() &&
     )
 }
 
+// Kotlin 2.2 rejects the old `android { kotlinOptions { jvmTarget = ... } }`
+// form at script compile time; this is its replacement (same JVM 17 target).
+kotlin {
+    compilerOptions {
+        jvmTarget.set(org.jetbrains.kotlin.gradle.dsl.JvmTarget.JVM_17)
+    }
+}
+
 flutter {
     source = "../.."
 }
@@ -167,7 +171,7 @@ if (playServiceAccountFile.exists()) {
         defaultToAppBundles.set(true)
         enabled.set(true)
         commit.set(true)
-        resolutionStrategy.set(com.github.triplet.gradle.play.ResolutionStrategy.IGNORE)
+        resolutionStrategy.set(com.github.triplet.gradle.androidpublisher.ResolutionStrategy.IGNORE)
     }
 } else {
     logger.warn(
