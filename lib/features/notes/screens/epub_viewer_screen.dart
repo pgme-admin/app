@@ -1198,7 +1198,11 @@ class _EpubViewerScreenState extends State<EpubViewerScreen>
           // blank pages) and a swipe could also trigger our own turn. Off on
           // iOS: pages turn only via next()/prev() (swipe + arrow buttons),
           // and _applyBookLayoutFixes stops drags from moving the pages.
-          snap: !Platform.isIOS, useSnapAnimationAndroid: false,
+          // Android scroll mode: no snap. The package turns snap into
+          // disableVerticalScroll on the web view, so the book could not be
+          // scrolled at all in scroll mode on Android.
+          snap: !Platform.isIOS && !_isScrollMode,
+          useSnapAnimationAndroid: false,
           theme: _isDarkMode ? EpubTheme.dark() : EpubTheme.light(),
           allowScriptedContent: false),
         selectionContextMenu: ContextMenu(

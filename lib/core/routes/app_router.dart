@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 import 'package:go_router/go_router.dart';
+import 'package:pgme/core/widgets/shell_back_handler.dart';
 import 'package:pgme/core/widgets/in_app_notification.dart';
 import 'package:pgme/features/splash/screens/splash_screen.dart';
 import 'package:pgme/features/onboarding/screens/onboarding_screen.dart';
@@ -549,25 +550,32 @@ class AppRouter {
               path.startsWith('/epub-viewer') ||
               path.startsWith('/downloads')) {
             final bottomPad = MediaQuery.of(context).padding.bottom;
-            return Stack(
-              children: [
-                child,
-                Positioned(
-                  left: 0,
-                  right: 0,
-                  bottom: bottomPad + 16,
-                  child: const MiniPlayerWidget(),
-                ),
-              ],
+            return ShellBackHandler(
+              isHome: false,
+              child: Stack(
+                children: [
+                  child,
+                  Positioned(
+                    left: 0,
+                    right: 0,
+                    bottom: bottomPad + 16,
+                    child: const MiniPlayerWidget(),
+                  ),
+                ],
+              ),
             );
           }
 
           final navIndex = _getNavIndex(location);
           final isSubscribed = state.uri.queryParameters['subscribed'] == 'true';
-          return AppScaffold(
-            currentIndex: navIndex,
-            isSubscribed: isSubscribed,
-            child: child,
+          return ShellBackHandler(
+            // Not navIndex == 0: course pages and others also map to tab 0.
+            isHome: path == '/home',
+            child: AppScaffold(
+              currentIndex: navIndex,
+              isSubscribed: isSubscribed,
+              child: child,
+            ),
           );
         },
         routes: [

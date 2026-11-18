@@ -1,5 +1,4 @@
 import 'package:flutter/material.dart';
-import 'package:flutter/services.dart';
 import 'package:go_router/go_router.dart';
 import 'package:provider/provider.dart';
 import 'package:pgme/core/providers/theme_provider.dart';
@@ -22,7 +21,6 @@ class AppScaffold extends StatelessWidget {
     this.isSubscribed = false,
   });
 
-  /// Handle Android back button press
   /// Space a scrolling page inside this scaffold must leave after its last
   /// item so that item clears the floating bottom navigation bar, and the
   /// mini player when it is showing. Mirrors the geometry in [build].
@@ -46,27 +44,6 @@ class AppScaffold extends StatelessWidget {
       // No provider above this context: nothing extra to clear.
     }
     return inset;
-  }
-
-  void _handleBackButton(BuildContext context, bool didPop) {
-    if (didPop) return; // Already popped by the system
-
-    final router = GoRouter.of(context);
-
-    // If the router has pages to pop (pushed sub-pages), pop them
-    if (router.canPop()) {
-      router.pop();
-      return;
-    }
-
-    // If not on the home tab, navigate to home
-    if (currentIndex != 0) {
-      context.go('/home');
-      return;
-    }
-
-    // On home tab with nothing to pop — exit the app
-    SystemNavigator.pop();
   }
 
   @override
@@ -97,10 +74,9 @@ class AppScaffold extends StatelessWidget {
     final inactiveIconColor = isDark ? AppColors.darkTextTertiary : const Color(0xFF666666);
     final activeIconColor = isDark ? const Color(0xFF00BEFA) : const Color(0xFF00C2FF);
 
-    return PopScope(
-      canPop: false,
-      onPopInvokedWithResult: (didPop, _) => _handleBackButton(context, didPop),
-      child: Scaffold(
+    // Android Back is handled for the whole shell by ShellBackHandler
+    // (see app_router.dart).
+    return Scaffold(
       backgroundColor: backgroundColor,
       extendBody: true,
       body: Stack(
@@ -219,7 +195,6 @@ class AppScaffold extends StatelessWidget {
             ),
         ],
       ),
-    ),
     );
   }
 

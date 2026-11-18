@@ -42,8 +42,12 @@ class MiniPlayerProvider extends ChangeNotifier with WidgetsBindingObserver {
     // When VideoPlayerScreen is open, it handles its own lifecycle.
     if (!_isMinimized || _controller == null) return;
 
+    // Pause only when the app really leaves the screen (paused / hidden).
+    // `inactive` also fires on Android when the notification shade is pulled
+    // down or another split-screen app is tapped, which stopped the lecture
+    // and never resumed it.
     if (state == AppLifecycleState.paused ||
-        state == AppLifecycleState.inactive) {
+        state == AppLifecycleState.hidden) {
       _controller?.pause();
     }
     if (state == AppLifecycleState.detached) {

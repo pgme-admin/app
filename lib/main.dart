@@ -106,6 +106,27 @@ class MyApp extends StatefulWidget {
 
 class _MyAppState extends State<MyApp> with WidgetsBindingObserver {
   bool _orientationSet = false;
+  // Phone (portrait only) or tablet (rotates), as last applied.
+  bool? _tabletClass;
+
+  @override
+  void didChangeMetrics() {
+    // The class was decided once at launch, so a foldable opened on its cover
+    // screen (or the app started in split screen) stayed portrait-locked
+    // after unfolding / going full screen. Re-apply the rule when the class
+    // changes; rotation and the keyboard never change it.
+    final current = _tabletClass;
+    if (current == null) return;
+    final view = WidgetsBinding.instance.platformDispatcher.views.first;
+    if (view.devicePixelRatio <= 0) return;
+    final shortest = view.physicalSize.shortestSide / view.devicePixelRatio;
+    if (shortest <= 0) return;
+    final tablet = shortest >= ResponsiveHelper.rotationTabletBreakpoint;
+    if (tablet == current) return;
+    _tabletClass = tablet;
+    SystemChrome.setPreferredOrientations(
+        ResponsiveHelper.supportedOrientationsForDevice());
+  }
 
   @override
   void initState() {
@@ -177,7 +198,8 @@ class _MyAppState extends State<MyApp> with WidgetsBindingObserver {
               // don't get portrait-locked.
               if (!_orientationSet) {
                 _orientationSet = true;
-                if (!ResponsiveHelper.isTabletDevice()) {
+                _tabletClass = ResponsiveHelper.isTabletDevice();
+                if (!_tabletClass!) {
                   SystemChrome.setPreferredOrientations([
                     DeviceOrientation.portraitUp,
                     DeviceOrientation.portraitDown,

@@ -37,7 +37,11 @@ class _TrailerVideoPlayerScreenState extends State<TrailerVideoPlayerScreen> wit
 
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
-    if (state == AppLifecycleState.paused || state == AppLifecycleState.inactive) {
+    // Pause only when the app really leaves the screen (paused / hidden).
+    // `inactive` also fires on Android when the notification shade is pulled
+    // down or another split-screen app is tapped, which stopped the lecture
+    // and never resumed it.
+    if (state == AppLifecycleState.paused || state == AppLifecycleState.hidden) {
       _playerController?.pause();
     }
   }

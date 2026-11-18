@@ -193,6 +193,16 @@ class AuthProvider with ChangeNotifier {
       _onboardingCompleted = authResponse.user.onboardingCompleted;
       _currentSessionId = authResponse.sessionId;
 
+      // Logout (PushNotificationService.cleanup) switched the push listeners
+      // off and only the splash switches them on, so after logging out and
+      // back in without restarting, in-app banners and notification taps did
+      // nothing. No-op when they are already on. Bounded like the splash:
+      // FCM calls can hang on devices with unhealthy Play Services.
+      unawaited(PushNotificationService()
+          .initialize()
+          .timeout(const Duration(seconds: 8), onTimeout: () {})
+          .catchError((Object e) => debugPrint('Push init after login failed: $e')));
+
       // Step 5: Register FCM token after successful authentication (await to ensure delivery)
       await PushNotificationService().registerToken();
 

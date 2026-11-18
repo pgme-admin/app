@@ -1,6 +1,8 @@
 package com.pgme.app
 
+import android.app.Activity
 import android.app.ActivityManager
+import android.app.Application
 import android.content.Context
 import android.os.Bundle
 import android.os.Debug
@@ -31,6 +33,37 @@ class MainActivity : FlutterActivity() {
                 WindowManager.LayoutParams.FLAG_SECURE,
                 WindowManager.LayoutParams.FLAG_SECURE
             )
+            protectOtherActivities(application)
+        }
+    }
+
+    companion object {
+        private var otherActivitiesProtected = false
+
+        /**
+         * The flag above covers this window only. Live classes open in the
+         * Zoom SDK's own meeting activity, which could therefore be
+         * screenshotted and screen-recorded. Give every other activity of the
+         * app the same protection as it is created. Registered once per
+         * process.
+         */
+        private fun protectOtherActivities(app: Application) {
+            if (otherActivitiesProtected) return
+            otherActivitiesProtected = true
+            app.registerActivityLifecycleCallbacks(object : Application.ActivityLifecycleCallbacks {
+                override fun onActivityCreated(activity: Activity, savedInstanceState: Bundle?) {
+                    activity.window?.setFlags(
+                        WindowManager.LayoutParams.FLAG_SECURE,
+                        WindowManager.LayoutParams.FLAG_SECURE
+                    )
+                }
+                override fun onActivityStarted(activity: Activity) {}
+                override fun onActivityResumed(activity: Activity) {}
+                override fun onActivityPaused(activity: Activity) {}
+                override fun onActivityStopped(activity: Activity) {}
+                override fun onActivitySaveInstanceState(activity: Activity, outState: Bundle) {}
+                override fun onActivityDestroyed(activity: Activity) {}
+            })
         }
     }
 

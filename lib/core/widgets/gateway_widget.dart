@@ -85,7 +85,7 @@ class _GatewayWidgetState extends State<GatewayWidget> {
             // tez://, bhim://, cred://, intent://, etc.
             if (uri.scheme != 'http' && uri.scheme != 'https' && uri.scheme != 'about') {
               debugPrint('Launching external app: ${request.url}');
-              launchUrl(uri, mode: LaunchMode.externalApplication);
+              _launchExternal(request.url);
               return NavigationDecision.prevent;
             }
             return NavigationDecision.navigate;
@@ -94,6 +94,47 @@ class _GatewayWidgetState extends State<GatewayWidget> {
       )
       // Load from backend - gives proper HTTPS origin for Gateway SDK
       ..loadRequest(Uri.parse(checkoutUrl));
+  }
+
+  /// Opens a non-web link from the checkout page in the app that handles it.
+  ///
+  /// Android checkout pages open UPI apps with `intent://` links, e.g.
+  /// `intent://pay?pa=...#Intent;scheme=upi;package=com.phonepe.app;end`.
+  /// Nothing handles the `intent` scheme itself, so launching it as-is did
+  /// nothing: open the target scheme (`upi://pay?pa=...`) instead, then the
+  /// page's own fallback URL if it gave one.
+  Future<void> _launchExternal(String url) async {
+    Future<bool> tryLaunch(Uri target) async {
+      try {
+        return await launchUrl(target, mode: LaunchMode.externalApplication);
+      } catch (e) {
+        debugPrint('Could not open $target: $e');
+        return false;
+      }
+    }
+
+    if (!url.startsWith('intent:')) {
+      await tryLaunch(Uri.parse(url));
+      return;
+    }
+    final marker = url.indexOf('#Intent;');
+    final params = <String, String>{};
+    if (marker >= 0) {
+      for (final part in url.substring(marker + '#Intent;'.length).split(';')) {
+        final eq = part.indexOf('=');
+        if (eq > 0) params[part.substring(0, eq)] = part.substring(eq + 1);
+      }
+    }
+    final scheme = params['scheme'];
+    if (scheme != null) {
+      final rest = (marker >= 0 ? url.substring(0, marker) : url)
+          .substring('intent:'.length);
+      if (await tryLaunch(Uri.parse('$scheme:$rest'))) return;
+    }
+    final fallback = params['S.browser_fallback_url'];
+    if (fallback != null) {
+      await tryLaunch(Uri.parse(Uri.decodeComponent(fallback)));
+    }
   }
 
   void _handlePaymentResponse(String message) {
