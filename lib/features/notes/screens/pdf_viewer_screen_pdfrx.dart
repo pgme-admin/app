@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:io';
 import 'dart:math' as math;
+import 'package:dio/dio.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:go_router/go_router.dart';
@@ -21,6 +22,7 @@ import 'package:pgme/core/services/progress_service.dart';
 import 'package:pgme/core/theme/app_theme.dart';
 import 'package:pgme/core/utils/responsive_helper.dart';
 import 'package:pgme/core/utils/highlight_placement.dart';
+import 'package:pgme/core/utils/page_slot_layout.dart';
 import 'package:pgme/core/widgets/app_dialog.dart';
 import 'package:pgme/features/notes/widgets/bookmarks_drawer.dart';
 
@@ -196,6 +198,7 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> {
   DateTime _tapDownAt = DateTime.fromMillisecondsSinceEpoch(0);
 
   void _onViewerPointerDown(PointerDownEvent e) {
+    _pointersOnViewer++;
     // Only a single-finger touch can be a tap; a second finger (pinch) cancels.
     _tapPointer = _tapPointer == null ? e.pointer : null;
     _tapDownPosition = e.position;
@@ -203,6 +206,7 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> {
   }
 
   void _onViewerPointerUp(PointerUpEvent e) {
+    _releaseViewerPointer();
     if (_tapPointer != e.pointer) return;
     _tapPointer = null;
     final moved = (e.position - _tapDownPosition).distance;
@@ -215,6 +219,209 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> {
     if (_contextMenuOverlay != null) return;
     if (widget.embedded) return;
     setState(() => _chromeVisible = !_chromeVisible);
+  }
+
+  void _releaseViewerPointer() {
+    if (_pointersOnViewer > 0) _pointersOnViewer--;
+    if (_pointersOnViewer == 0) {
+      // The touch moved the view off the page it rested on (a drag of the
+      // page thumb, a pan while zoomed): that page no longer applies.
+      final anchor = _anchorPage;
+      if (anchor != null && !_isAlignedOn(anchor)) _anchorPage = null;
+      _scheduleSettle();
+    }
+  }
+
+  // ── One page at a time (full-screen reader) ───────────────────────
+  //
+  // Each page sits in a "slot" shaped like the view (_layoutInPageSlots).
+  // At the zoom that fits a page whole, its slot fills the view exactly, so
+  // no part of the neighbouring pages shows. A swipe that ends at that zoom
+  // turns to the next or previous page (or springs back); zoomed in, panning
+  // is free. The pane beside a video (embedded) keeps continuous scrolling.
+
+  int _pointersOnViewer = 0;
+  int? _swipeFromPage;
+  double? _swipeFromY; // centre of the view (document units) at gesture start
+  bool _swipeScaled = false;
+  // Set when a gesture ends in a page snap: tells pdfrx to skip its fling,
+  // which would otherwise fight the snap animation.
+  bool _snapOnGestureEnd = false;
+  // The page the reader rests on (or is heading to). While no finger is on
+  // the viewer, pdfrx is told this is the current page, so a resize (toolbar
+  // shown/hidden, search bar, keyboard, rotation) re-centres on it. Guessing
+  // from a view that is mid-animation instead drifted to other pages.
+  int? _anchorPage;
+  Timer? _settleTimer;
+  int _settleSnaps = 0;
+  // Fling speed (logical px/s) that turns a short swipe into a page turn.
+  static const double _pageTurnFlingSpeed = 300;
+
+  /// Size of the viewer area, or null before pdfrx has laid it out.
+  Size? _viewerSize() {
+    try {
+      return _pdfController.isReady ? _pdfController.viewSize : null;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  static PdfPageLayout _layoutInPageSlots(List<Size> sizes, double viewAspect) {
+    final slots = PageSlotLayout.compute(sizes, viewAspect);
+    return PdfPageLayout(
+        pageLayouts: slots.pageRects, documentSize: slots.documentSize);
+  }
+
+  /// Zoom at which [pageNumber] fits the view whole.
+  double? _fitZoomOf(int pageNumber) {
+    final view = _viewerSize();
+    if (view == null ||
+        pageNumber < 1 ||
+        pageNumber > _pdfController.pageCount) {
+      return null;
+    }
+    final r = _pdfController.layout.pageLayouts[pageNumber - 1];
+    if (r.width <= 0 || r.height <= 0) return null;
+    return math.min(view.width / r.width, view.height / r.height);
+  }
+
+  /// True when [pageNumber] is shown at (or below) its whole-page zoom.
+  bool _atPageZoom(int pageNumber) {
+    final fit = _fitZoomOf(pageNumber);
+    return fit != null && _pdfController.currentZoom <= fit * 1.05;
+  }
+
+  void _snapToPage(int pageNumber) =>
+      _goToPageWhole(pageNumber, duration: const Duration(milliseconds: 220));
+
+  /// Every jump in the reader goes through here so the page it lands on is
+  /// remembered (see [_anchorPage]). Embedded (continuous) mode just jumps.
+  void _goToPageWhole(int pageNumber,
+      {Duration duration = const Duration(milliseconds: 200)}) {
+    if (!_pdfController.isReady) return;
+    final page = pageNumber.clamp(1, _pdfController.pageCount);
+    if (!widget.embedded) _anchorPage = page;
+    _pdfController.goToPage(
+      pageNumber: page,
+      anchor: widget.embedded ? null : PdfPageAnchor.all,
+      duration: duration,
+    );
+  }
+
+  /// [pageNumber] fills the view whole, at rest (page zoom, centred).
+  bool _isAlignedOn(int pageNumber) {
+    if (!_pdfController.isReady) return false;
+    final fit = _fitZoomOf(pageNumber);
+    if (fit == null) return false;
+    final r = _pdfController.layout.pageLayouts[pageNumber - 1];
+    return (_pdfController.currentZoom - fit).abs() <= fit * 0.01 &&
+        (_pdfController.visibleRect.center - r.center).distance <= 2;
+  }
+
+  /// The page showing the largest share of itself in [visible].
+  static int? _mostVisiblePage(Rect visible, List<Rect> pageRects) {
+    int? best;
+    double bestRatio = 0;
+    for (int i = 0; i < pageRects.length; i++) {
+      final r = pageRects[i];
+      final overlap = r.intersect(visible);
+      if (overlap.width <= 0 || overlap.height <= 0) continue;
+      final ratio = (overlap.width * overlap.height) / (r.width * r.height);
+      if (ratio > bestRatio) {
+        bestRatio = ratio;
+        best = i + 1;
+      }
+    }
+    return best;
+  }
+
+  int? _currentPageForPageView(
+      Rect visible, List<Rect> pageRects, PdfViewerController controller) {
+    final anchor = _anchorPage;
+    if (_pointersOnViewer == 0 && anchor != null && anchor <= pageRects.length) {
+      return anchor;
+    }
+    return _mostVisiblePage(visible, pageRects);
+  }
+
+  void _onPageViewGestureStart(ScaleStartDetails details) {
+    if (widget.embedded || !_pdfController.isReady) return;
+    _settleTimer?.cancel();
+    _settleSnaps = 0;
+    _snapOnGestureEnd = false;
+    _swipeFromPage = _pdfController.pageNumber;
+    _swipeFromY = _pdfController.visibleRect.center.dy;
+    _swipeScaled = false;
+  }
+
+  void _onPageViewGestureUpdate(ScaleUpdateDetails details) {
+    if (details.pointerCount > 1 || (details.scale - 1).abs() > 0.01) {
+      _swipeScaled = true;
+    }
+  }
+
+  void _onPageViewGestureEnd(ScaleEndDetails details) {
+    _snapOnGestureEnd = false;
+    if (widget.embedded || !_pdfController.isReady) return;
+    final from = _swipeFromPage;
+    final fromY = _swipeFromY;
+    _swipeFromPage = null;
+    _swipeFromY = null;
+    final current = _pdfController.pageNumber ?? from;
+    // Zoomed in on a page: free panning (with momentum), no snapping.
+    if (current == null || !_atPageZoom(current)) return;
+    var target = current;
+    final fit = from == null ? null : _fitZoomOf(from);
+    final view = _viewerSize();
+    if (!_swipeScaled && from != null && fromY != null && fit != null && view != null) {
+      final slotHeight = view.height / fit;
+      // + = moved towards later pages.
+      final moved = _pdfController.visibleRect.center.dy - fromY;
+      // - = finger moving up = towards later pages.
+      final vy = details.velocity.pixelsPerSecond.dy;
+      final slow = vy.abs() <= _pageTurnFlingSpeed;
+      if (vy < -_pageTurnFlingSpeed || (slow && moved > slotHeight * 0.15)) {
+        target = from + 1;
+      } else if (vy > _pageTurnFlingSpeed ||
+          (slow && moved < -slotHeight * 0.15)) {
+        target = from - 1;
+      } else {
+        target = from;
+      }
+    }
+    _snapOnGestureEnd = true;
+    _snapToPage(target);
+  }
+
+  void _onViewerTransformChanged() {
+    if (widget.embedded) return;
+    _scheduleSettle();
+  }
+
+  void _scheduleSettle() {
+    if (widget.embedded) return;
+    _settleTimer?.cancel();
+    _settleTimer = Timer(const Duration(milliseconds: 400), _settleOnWholePage);
+  }
+
+  /// When the view comes to rest without a gesture end deciding where (the
+  /// page scroll thumb, a search jump), put it back on one whole page.
+  void _settleOnWholePage() {
+    if (!mounted || !_pdfController.isReady || _pointersOnViewer > 0) return;
+    final page = _anchorPage ??
+        _mostVisiblePage(
+            _pdfController.visibleRect, _pdfController.layout.pageLayouts);
+    if (page == null || !_atPageZoom(page)) return;
+    if (_isAlignedOn(page)) {
+      _anchorPage = page;
+      _settleSnaps = 0;
+      return;
+    }
+    // A couple of attempts at most, so a position pdfrx cannot reach
+    // exactly never turns into an endless loop of snaps.
+    if (_settleSnaps >= 2) return;
+    _settleSnaps++;
+    _snapToPage(page);
   }
 
   // True once the saved reading position has been fetched/applied (or there is
@@ -294,6 +501,7 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> {
   @override
   void initState() {
     super.initState();
+    _pdfController.addListener(_onViewerTransformChanged);
     if (!widget.embedded) {
       // Full-screen reader: allow reading in any orientation (phones are
       // otherwise portrait-only); dispose() restores the device default.
@@ -330,14 +538,11 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> {
     _contextMenuOverlay = null;
     _contextMenuDebounce?.cancel();
     _progressDebounceTimer?.cancel();
+    _downloadCancel?.cancel();
     final documentId = widget.documentId;
     final lastPage = _currentPage.value;
-    // Ebook ids are not valid for the document-progress route (it 404s), and
-    // saving before the saved page was restored would reset it to page 1.
-    if (documentId != null &&
-        lastPage > 0 &&
-        widget.source != 'ebook' &&
-        _progressRestored) {
+    // Saving before the saved page was restored would reset it to page 1.
+    if (documentId != null && lastPage > 0 && _progressRestored) {
       _progressService
           .updateDocumentProgress(documentId: documentId, pageNumber: lastPage)
           .catchError((Object e) {
@@ -346,6 +551,9 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> {
       });
     }
     _currentPage.dispose();
+    _settleTimer?.cancel();
+    _pdfController.removeListener(_onViewerTransformChanged);
+    _textSearcher?.removeListener(_onSearchChanged);
     _textSearcher?.dispose();
     _searchController.dispose();
     // Dispose the pre-loaded document. We pass it to PdfViewer with
@@ -356,9 +564,20 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> {
     super.dispose();
   }
 
-  // ── PDF loading (identical to Syncfusion version) ─────────────────
+  // ── PDF loading ───────────────────────────────────────────────────
+  //
+  // Order: a copy the user downloaded for offline use, then the signed URL
+  // (the caller's on the first try; a fresh one on Retry, since signed links
+  // expire), then the on-device cache, then the network. When the server
+  // cannot be reached at all, a cached copy still opens.
+
+  CancelToken? _downloadCancel;
+  int _loadAttempts = 0;
+  // A downloaded copy that failed to open is skipped (and deleted) once.
+  bool _skipDownloadedCopy = false;
 
   Future<void> _loadPdf() async {
+    final attempt = ++_loadAttempts;
     try {
       if (widget.filePath != null) {
         if (mounted) {
@@ -368,46 +587,42 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> {
         return;
       }
 
-      if (widget.documentId != null) {
-        final docFileName = 'doc_${widget.documentId}.pdf';
-        final ebookFileName = 'ebook_${widget.documentId}.pdf';
+      final documentId = widget.documentId;
+      if (documentId != null && !_skipDownloadedCopy) {
         final downloadedPath =
-            await DownloadService().getDownloadedPath(docFileName) ??
-                await DownloadService().getDownloadedPath(ebookFileName);
-        if (downloadedPath != null) {
-          final file = File(downloadedPath);
-          final fileSize = await file.length();
-          if (fileSize > 0 && mounted) {
-            setState(() => _isLoading = false);
-            _loadDocumentFully(downloadedPath);
-            return;
-          }
+            await DownloadService().getDownloadedPath('doc_$documentId.pdf') ??
+                await DownloadService()
+                    .getDownloadedPath('ebook_$documentId.pdf');
+        if (downloadedPath != null &&
+            await File(downloadedPath).length() > 0 &&
+            mounted) {
+          setState(() => _isLoading = false);
+          _loadDocumentFully(downloadedPath, downloadedCopy: true);
+          return;
         }
       }
 
       String pdfUrl;
-      if (widget.pdfUrl != null) {
-        pdfUrl = widget.pdfUrl!;
-      } else if (widget.source == 'ebook') {
-        // Ebooks live behind a different access-controlled endpoint.
-        // EbookAccessService handles the entitlement check + signed URL.
-        final data =
-            await EbookAccessService().getEbookViewUrl(widget.documentId!);
-        pdfUrl = data['url'] as String;
-      } else {
-        final apiService = ApiService();
-        final response = await apiService.dio.get(
-          ApiConstants.documentViewUrl(widget.documentId!),
-        );
-        pdfUrl = response.data['data']['url'] as String;
+      try {
+        pdfUrl = await _resolvePdfUrl(firstAttempt: attempt == 1);
+      } catch (e) {
+        // Offline: open the cached copy if there is one.
+        if (documentId != null && isNoConnectionError(e)) {
+          final cached = await PdfCacheService.getCachedFile(documentId);
+          if (cached != null && mounted) {
+            setState(() => _isLoading = false);
+            _loadDocumentFully(cached.path, cacheKey: documentId);
+            return;
+          }
+        }
+        rethrow;
       }
-
       if (!mounted) return;
 
       // Persistent on-device cache (TTL + LRU). Same key whether the URL
       // was a fresh signed S3 link or the static one — documentId is
       // preferred so URL rotation doesn't invalidate the cached copy.
-      final cacheKey = widget.documentId ?? 'url_${pdfUrl.hashCode}';
+      final cacheKey = documentId ?? 'url_${pdfUrl.hashCode}';
       final cached = await PdfCacheService.getCachedFile(cacheKey);
       if (cached != null) {
         if (mounted) {
@@ -419,29 +634,105 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> {
         return;
       }
 
+      // Cancelled in dispose(): leaving the reader stops the download.
+      final cancel = _downloadCancel = CancelToken();
       final downloaded = await PdfCacheService.cacheFromUrl(
         cacheKey,
         pdfUrl,
+        cancelToken: cancel,
         onReceiveProgress: (received, total) {
           if (total > 0 && mounted) {
             setState(() => _downloadProgress = received / total);
           }
         },
       );
+      // The cache's size cap was only enforced at app start.
+      unawaited(PdfCacheService.pruneToSizeLimit());
 
       if (mounted) {
         setState(() => _isLoading = false);
         _loadDocumentFully(downloaded.path, cacheKey: cacheKey);
       }
     } catch (e) {
+      if (e is DioException && CancelToken.isCancel(e)) return;
       debugPrint('PDF load error: $e');
       if (mounted) {
         setState(() {
-          _error = 'Failed to load PDF';
+          _error = _loadErrorMessage(e);
           _isLoading = false;
         });
       }
     }
+  }
+
+  /// Signed URL for the document. The caller's URL is used on the first
+  /// attempt only: on Retry it may have expired, so a fresh one is fetched
+  /// whenever the document id allows it.
+  Future<String> _resolvePdfUrl({required bool firstAttempt}) async {
+    final given = widget.pdfUrl;
+    final id = widget.documentId;
+    if (given != null && (firstAttempt || id == null)) return given;
+    if (widget.source == 'ebook') {
+      // Ebooks live behind a different access-controlled endpoint.
+      // EbookAccessService handles the entitlement check + signed URL.
+      final data = await EbookAccessService().getEbookViewUrl(id!);
+      return data['url'] as String;
+    }
+    final response =
+        await ApiService().dio.get(ApiConstants.documentViewUrl(id!));
+    return response.data['data']['url'] as String;
+  }
+
+  /// A message the reader can act on, instead of one "Failed to load PDF"
+  /// for every cause.
+  String _loadErrorMessage(Object e) {
+    if (isNoConnectionError(e)) {
+      return 'No internet connection.\nConnect and try again.';
+    }
+    if (e is PdfPasswordException) {
+      return 'This PDF is password-protected\nand cannot be opened here.';
+    }
+    if (e is DioException) {
+      switch (e.response?.statusCode) {
+        case 401:
+          return 'Your session has expired.\nPlease sign in again.';
+        case 403:
+          return "You don't have access to this book.";
+        case 404:
+          return 'This file is no longer available.';
+      }
+      final message = e.response?.data is Map
+          ? (e.response!.data as Map)['message']
+          : null;
+      if (message is String && message.trim().isNotEmpty) return message;
+    }
+    if (e is FileSystemException &&
+        (e.osError?.errorCode == 28 ||
+            (e.osError?.message.toLowerCase().contains('space') ?? false))) {
+      return 'Not enough storage space\nto open this book.';
+    }
+    // Server messages passed on by EbookAccessService ("You have not
+    // purchased this ebook").
+    if (e.runtimeType.toString() == '_Exception') {
+      final text = e.toString().replaceFirst('Exception: ', '').trim();
+      if (text.isNotEmpty && text.length < 120) return text;
+    }
+    return "Couldn't load this PDF.\nPlease try again.";
+  }
+
+  void _retryLoad() {
+    setState(() {
+      _error = null;
+      _isLoading = true;
+      _isPdfReady = false;
+      _downloadProgress = 0;
+      _totalPages = 0;
+      _loadedPages = 0;
+      _cachedPdfViewer = null;
+      _highlightsLoaded = false;
+      _bookmarksLoaded = false;
+    });
+    _loadPdf();
   }
 
   /// Opens the PDF and fully loads ALL page metadata via
@@ -450,10 +741,12 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> {
   /// progress UI instead of the viewer — preventing the half-loaded
   /// state where the user would otherwise see page 1 but couldn't
   /// scroll past whatever batch had been loaded so far.
-  Future<void> _loadDocumentFully(String filePath, {String? cacheKey}) async {
+  Future<void> _loadDocumentFully(String filePath,
+      {String? cacheKey, bool downloadedCopy = false}) async {
     if (!mounted) return;
+    PdfDocument? opened;
     try {
-      final doc = await PdfDocument.openFile(
+      final doc = opened = await PdfDocument.openFile(
         filePath,
         useProgressiveLoading: true, // only page 1 loads here — fast
       );
@@ -497,7 +790,7 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> {
       // PdfViewer has had a chance to mount and attach _pdfController.
       WidgetsBinding.instance.addPostFrameCallback((_) {
         if (!mounted) return;
-        _textSearcher ??= PdfTextSearcher(_pdfController);
+        _textSearcher ??= _createTextSearcher();
         _loadHighlights();
         _loadBookmarks();
         _loadOutline();
@@ -505,6 +798,31 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> {
       });
     } catch (e) {
       debugPrint('[PDFRX] Failed to load document: $e');
+      try {
+        await opened?.dispose();
+      } catch (_) {}
+      if (e is PdfPasswordException) {
+        // The file itself is fine; deleting it would only re-download it.
+        if (mounted) setState(() => _error = _loadErrorMessage(e));
+        return;
+      }
+      // A downloaded (offline) copy that does not open is damaged: delete it
+      // and fetch the document again instead of failing on every open.
+      if (downloadedCopy) {
+        try {
+          await File(filePath).delete();
+        } catch (_) {}
+        if (mounted && !_skipDownloadedCopy) {
+          _skipDownloadedCopy = true;
+          setState(() {
+            _isLoading = true;
+            _totalPages = 0;
+            _loadedPages = 0;
+          });
+          _loadPdf();
+          return;
+        }
+      }
       // If this load came from a cached file (cacheKey != null), the
       // cached file is the most likely culprit (corrupt download, partial
       // bytes, server returned non-PDF that bypassed magic-byte check on a
@@ -514,22 +832,18 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> {
         await PdfCacheService.invalidate(cacheKey);
       }
       if (mounted) {
-        setState(() {
-          _error = 'Failed to load PDF';
-        });
+        setState(() => _error = _loadErrorMessage(e));
       }
     }
   }
 
   // ── Progress ──────────────────────────────────────────────────────
+  //
+  // The document-progress route accepts ebook (Book) ids as well since
+  // backend eea54df, so ebooks restore and save their page too.
 
   Future<void> _restoreProgress() async {
     if (widget.documentId == null) return;
-    // Backend `/users/progress/document/<id>` only knows about library
-    // documents. Ebooks live in a separate collection and the route 404s
-    // for them — no point hitting it. Re-enable once backend exposes
-    // /users/progress/ebook/<id> (or unifies the routes).
-    if (widget.source == 'ebook') return;
     try {
       final progress =
           await _progressService.getDocumentProgress(widget.documentId!);
@@ -539,18 +853,20 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> {
         if (mounted) {
           // Immediate jump: an animated jump can be cancelled by a viewport
           // resize (keyboard / insets settling) and land on the wrong page.
-          _pdfController.goToPage(
-              pageNumber: savedPage, duration: Duration.zero);
+          _goToPageWhole(savedPage, duration: Duration.zero);
         }
       }
+      // Only now may the current page be saved: after a failed fetch
+      // (offline, timeout) saving would overwrite the real position with
+      // wherever the reader happens to be.
+      _progressRestored = true;
     } catch (e) {
       debugPrint('Failed to restore progress: $e');
-    } finally {
-      _progressRestored = true;
     }
   }
 
   void _debouncedSaveProgress(int pageNumber) {
+    if (!_progressRestored) return;
     _progressDebounceTimer?.cancel();
     _progressDebounceTimer = Timer(const Duration(seconds: 2), () {
       _saveProgress(pageNumber);
@@ -559,10 +875,6 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> {
 
   Future<void> _saveProgress(int pageNumber) async {
     if (widget.documentId == null) return;
-    // See _restoreProgress — ebook IDs aren't valid for the document
-    // progress route. Skip silently instead of spamming "Resource not
-    // found" every page change.
-    if (widget.source == 'ebook') return;
     try {
       await _progressService.updateDocumentProgress(
         documentId: widget.documentId!,
@@ -2374,7 +2686,7 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> {
             // viewport, which cancels an in-flight animated jump and leaves
             // the viewer on a much earlier page.
             if (mounted) {
-              _pdfController.goToPage(pageNumber: n, duration: Duration.zero);
+              _goToPageWhole(n, duration: Duration.zero);
             }
           });
         },
@@ -2523,7 +2835,7 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> {
       _scaffoldKey.currentState?.closeDrawer();
       // Defer slightly so the drawer-close animation runs first.
       Future.delayed(const Duration(milliseconds: 200), () {
-        if (mounted) _pdfController.goToPage(pageNumber: pageNumber);
+        if (mounted) _goToPageWhole(pageNumber);
       });
     }
 
@@ -2613,7 +2925,7 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> {
     if (pageNumber == null) return;
     Navigator.pop(sheetContext);
     Future.delayed(const Duration(milliseconds: 200), () {
-      if (mounted) _pdfController.goToPage(pageNumber: pageNumber);
+      if (mounted) _goToPageWhole(pageNumber);
     });
   }
 
@@ -3075,7 +3387,84 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> {
     if (!_isSearchOpen) {
       _textSearcher?.resetTextSearch();
       _searchController.clear();
+      _searchStatus = null;
+      _lastSearchIndex = null;
     }
+  }
+
+  // "3 of 12" / "No results" / "Page 150" under the search field.
+  String? _searchStatus;
+  int? _lastSearchIndex;
+
+  PdfTextSearcher _createTextSearcher() =>
+      PdfTextSearcher(_pdfController)..addListener(_onSearchChanged);
+
+  String? _computeSearchStatus() {
+    final s = _textSearcher;
+    if (s == null || s.pattern == null) return null;
+    final count = s.matches.length;
+    if (count == 0) return s.isSearching ? 'Searching...' : 'No results';
+    final more = s.isSearching ? '+' : '';
+    final i = s.currentIndex;
+    return i == null ? '$count$more found' : '${i + 1} of $count$more';
+  }
+
+  /// pdfrx notifies once per searched page: refresh the label only when its
+  /// text changes, and land a newly selected match on its whole page.
+  void _onSearchChanged() {
+    if (!mounted) return;
+    final status = _computeSearchStatus();
+    if (status != _searchStatus) setState(() => _searchStatus = status);
+    final i = _textSearcher?.currentIndex;
+    if (i != null && i != _lastSearchIndex) {
+      // After pdfrx's own scroll-to-match animation (200 ms).
+      _landOnCurrentMatch(delay: const Duration(milliseconds: 260));
+    }
+  }
+
+  /// pdfrx only scrolls a match into view; in the page-at-a-time reader that
+  /// can leave the view between two pages, so show the match's whole page.
+  void _landOnCurrentMatch({Duration delay = Duration.zero}) {
+    final s = _textSearcher;
+    final i = s?.currentIndex;
+    if (s == null || i == null || i < 0 || i >= s.matches.length) return;
+    _lastSearchIndex = i;
+    if (mounted) setState(() => _searchStatus = _computeSearchStatus());
+    if (widget.embedded) return;
+    final page = s.matches[i].pageNumber;
+    Future.delayed(delay, () {
+      if (mounted) _snapToPage(page);
+    });
+  }
+
+  /// A bare number in the search field is a page number (same numbering as
+  /// the page counter); anything else is a text search.
+  void _submitSearch(String value) {
+    final query = value.trim();
+    if (query.isEmpty || _textSearcher == null) return;
+    final asPage = int.tryParse(query);
+    if (asPage != null && _pdfController.isReady) {
+      _textSearcher!.resetTextSearch();
+      _lastSearchIndex = null;
+      final total = _pdfController.pageCount;
+      if (asPage >= 1 && asPage <= total) {
+        setState(() => _searchStatus = 'Page $asPage');
+        // Same as the go-to-page dialog: submitting hides the keyboard,
+        // and that resize re-anchors the viewer on the page it is on at
+        // that moment, cancelling a jump in flight. Jump once it settled.
+        FocusManager.instance.primaryFocus?.unfocus();
+        Future.delayed(const Duration(milliseconds: 350), () {
+          if (mounted) {
+            _goToPageWhole(asPage, duration: Duration.zero);
+          }
+        });
+      } else {
+        setState(() => _searchStatus = 'Pages 1-$total');
+      }
+      return;
+    }
+    _lastSearchIndex = null;
+    _textSearcher!.startTextSearch(query, searchImmediately: true);
   }
 
   // ── Selection guard for bottom bar ────────────────────────────────
@@ -3138,7 +3527,7 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> {
               isTablet: isTablet,
               onJumpToPage: (page) {
                 _scaffoldKey.currentState?.closeEndDrawer();
-                _pdfController.goToPage(pageNumber: page);
+                _goToPageWhole(page);
               },
               onDeleteBookmark: (bookmarkId, pageNumber) async {
                 try {
@@ -3185,14 +3574,17 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> {
                 .copyWith(statusBarColor: Colors.transparent),
       ),
       body: _error != null
-          ? _buildErrorView(isTablet, textColor)
+          ? _withCloseButton(
+              _buildErrorView(isTablet, textColor), isDark, textColor, isTablet)
           : _isLoading
-              ? _buildLoadingView(isTablet)
+              ? _withCloseButton(
+                  _buildLoadingView(isTablet), isDark, textColor, isTablet)
               : _document == null
                   // PDF file resolved but pages still loading — show full-
                   // screen progress so the user CANNOT see / interact with
                   // a half-loaded document.
-                  ? _buildPageLoadingView(isTablet, isDark)
+                  ? _withCloseButton(_buildPageLoadingView(isTablet, isDark),
+                      isDark, textColor, isTablet)
                   // No safety-overlay here. _isPdfReady is now set
                   // synchronously with _document in _loadDocumentFully, so
                   // by the time we enter this branch (_document != null)
@@ -3225,7 +3617,10 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> {
                             behavior: HitTestBehavior.translucent,
                             onPointerDown: _onViewerPointerDown,
                             onPointerUp: _onViewerPointerUp,
-                            onPointerCancel: (_) => _tapPointer = null,
+                            onPointerCancel: (_) {
+                              _tapPointer = null;
+                              _releaseViewerPointer();
+                            },
                             child: _buildPdfViewer(),
                           ),
                         ),
@@ -3335,32 +3730,23 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> {
         // viewer is in dark mode and the page hasn't rendered yet) doesn't
         // flash grey. Default is Colors.grey.
         backgroundColor: Colors.transparent,
-        // Full-screen reader opens on one whole page (fitZoom = the entire
-        // page inside the view). Filling the width instead (coverZoom) cut
-        // the page off wherever the view is wider than a page's shape, i.e.
-        // tablets, landscape and short phones, so the book opened zoomed in
-        // and readers had to pinch out every time. On tall phones both are
-        // the same. The pane beside a video keeps filling its width.
+        // Full-screen reader: one page at a time (see _layoutInPageSlots).
+        // It opens on page 1 fitted whole and centred, and every jump (go to
+        // page, saved position, search, bookmarks, rotation, toolbar hide)
+        // lands on one whole page because the anchor is the whole page. The
+        // pane beside a video keeps the continuous, fill-the-width reader.
         calculateInitialZoom: (document, controller, fitZoom, coverZoom) =>
             widget.embedded ? coverZoom : fitZoom,
-        // Rotating keeps pdfrx's zoom, which would cut the page off again
-        // (portrait -> landscape) or leave it small. Re-fit the current page
-        // when the orientation flips; other resizes (keyboard) are left alone.
-        onViewSizeChanged: (viewSize, oldViewSize, controller) {
-          if (widget.embedded || oldViewSize == null) return;
-          final wasLandscape = oldViewSize.width > oldViewSize.height;
-          final isLandscape = viewSize.width > viewSize.height;
-          if (wasLandscape == isLandscape) return;
-          // Not during build (see PdfViewerParams.onViewSizeChanged); after
-          // pdfrx's own post-resize page jump.
-          Future.delayed(const Duration(milliseconds: 250), () {
-            if (!mounted || !controller.isReady) return;
-            final page = controller.pageNumber ?? _currentPage.value;
-            if (page < 1 || page > controller.pageCount) return;
-            controller.goTo(controller.calcMatrixForFit(pageNumber: page),
-                duration: Duration.zero);
-          });
-        },
+        pageAnchor: widget.embedded ? PdfPageAnchor.top : PdfPageAnchor.all,
+        pageAnchorEnd:
+            widget.embedded ? PdfPageAnchor.bottom : PdfPageAnchor.all,
+        calculateCurrentPageNumber:
+            widget.embedded ? null : _currentPageForPageView,
+        onInteractionStart: _onPageViewGestureStart,
+        onInteractionUpdate: _onPageViewGestureUpdate,
+        onInteractionEnd: _onPageViewGestureEnd,
+        // No fling when the gesture ends in a page snap (the snap animates).
+        allowInteractionInertia: (_) => !_snapOnGestureEnd,
         // Cap the rendered-page bitmap cache. pdfrx default is 100MB which
         // is too generous for mid-tier Android tablets where the per-app heap
         // is 256-384MB. 50MB holds 8-12 page bitmaps at typical sizes —
@@ -3397,21 +3783,30 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> {
           // cannot scroll past the loaded chunk.
           final pageCount =
               _totalPages > pages.length ? _totalPages : pages.length;
-          // Document width = widest known page (or estimate if all unknown).
-          double maxW = estW;
-          for (final p in pages) {
-            final w = p.width > 0 ? p.width : estW;
-            if (w > maxW) maxW = w;
+          final sizes = <Size>[
+            for (int i = 0; i < pageCount; i++)
+              Size(
+                (i < pages.length && pages[i].width > 0) ? pages[i].width : estW,
+                (i < pages.length && pages[i].height > 0)
+                    ? pages[i].height
+                    : estH,
+              ),
+          ];
+          final view = widget.embedded ? null : _viewerSize();
+          if (view != null && view.width > 0 && view.height > 0) {
+            return _layoutInPageSlots(sizes, view.height / view.width);
+          }
+          double maxW = 0;
+          for (final size in sizes) {
+            if (size.width > maxW) maxW = size.width;
           }
           final docW = maxW + params.margin * 2;
           final layouts = <Rect>[];
           var y = params.margin;
-          for (int i = 0; i < pageCount; i++) {
-            final page = i < pages.length ? pages[i] : null;
-            final w = (page != null && page.width > 0) ? page.width : estW;
-            final h = (page != null && page.height > 0) ? page.height : estH;
-            layouts.add(Rect.fromLTWH((docW - w) / 2, y, w, h));
-            y += h + params.margin;
+          for (final size in sizes) {
+            layouts.add(Rect.fromLTWH(
+                (docW - size.width) / 2, y, size.width, size.height));
+            y += size.height + params.margin;
           }
           return PdfPageLayout(
               pageLayouts: layouts, documentSize: Size(docW, y));
@@ -3427,6 +3822,34 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> {
           PdfViewerScrollThumb(
             controller: _pdfController,
             orientation: ScrollbarOrientation.right,
+            // pdfrx's default thumb is 25 px wide, so page numbers from 100
+            // up wrapped onto two lines ("55" over "8").
+            thumbSize: const Size(44, 36),
+            thumbBuilder: (context, thumbSize, pageNumber, controller) =>
+                Container(
+              decoration: BoxDecoration(
+                color: Colors.white,
+                borderRadius: BorderRadius.circular(6),
+                boxShadow: [
+                  BoxShadow(
+                    color: Colors.black.withAlpha(110),
+                    spreadRadius: 1,
+                    blurRadius: 1,
+                    offset: const Offset(1, 1),
+                  ),
+                ],
+              ),
+              padding: const EdgeInsets.symmetric(horizontal: 4),
+              alignment: Alignment.center,
+              child: FittedBox(
+                fit: BoxFit.scaleDown,
+                child: Text(
+                  '${pageNumber ?? ''}',
+                  maxLines: 1,
+                  style: const TextStyle(fontSize: 13, color: Colors.black87),
+                ),
+              ),
+            ),
           ),
         ],
         pagePaintCallbacks: [
@@ -3450,7 +3873,7 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> {
         onDocumentChanged: (document) {
           if (document != null && !_isPdfReady) {
             setState(() => _isPdfReady = true);
-            _textSearcher = PdfTextSearcher(_pdfController);
+            _textSearcher = _createTextSearcher();
             _loadHighlights();
             _loadBookmarks();
             _restoreProgress();
@@ -3495,13 +3918,7 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> {
             Row(
               children: [
                 GestureDetector(
-                  onTap: () {
-                    if (widget.embedded) {
-                      widget.onClose?.call();
-                    } else {
-                      context.pop();
-                    }
-                  },
+                  onTap: _closeReader,
                   child: Container(
                     width: isTablet ? 44 : 36,
                     height: isTablet ? 44 : 36,
@@ -3825,7 +4242,7 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> {
             autofocus: true,
             style: TextStyle(fontSize: isTablet ? 16 : 14, color: textColor),
             decoration: InputDecoration(
-              hintText: 'Search in document...',
+              hintText: 'Search text or page number',
               hintStyle: TextStyle(
                 color: isDark ? AppColors.darkTextSecondary : Colors.grey,
                 fontSize: isTablet ? 16 : 14,
@@ -3843,24 +4260,46 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> {
                 borderSide: BorderSide.none,
               ),
             ),
-            onSubmitted: (value) {
-              if (value.isNotEmpty && _textSearcher != null) {
-                _textSearcher!.startTextSearch(value);
-              }
-            },
+            textInputAction: TextInputAction.search,
+            onSubmitted: _submitSearch,
           ),
         ),
+        if (_searchStatus != null) ...[
+          SizedBox(width: isTablet ? 10 : 8),
+          Text(
+            _searchStatus!,
+            style: TextStyle(
+              fontSize: isTablet ? 13 : 12,
+              fontWeight: FontWeight.w500,
+              color: isDark ? AppColors.darkTextSecondary : Colors.grey[700],
+            ),
+          ),
+        ],
         if (_textSearcher != null) ...[
           SizedBox(width: isTablet ? 8 : 4),
           GestureDetector(
-            onTap: () => _textSearcher?.goToPrevMatch(),
-            child: Icon(Icons.keyboard_arrow_up,
-                size: isTablet ? 28 : 24, color: textColor),
+            behavior: HitTestBehavior.opaque,
+            onTap: () async {
+              await _textSearcher?.goToPrevMatch();
+              _landOnCurrentMatch();
+            },
+            child: Padding(
+              padding: const EdgeInsets.all(4),
+              child: Icon(Icons.keyboard_arrow_up,
+                  size: isTablet ? 28 : 24, color: textColor),
+            ),
           ),
           GestureDetector(
-            onTap: () => _textSearcher?.goToNextMatch(),
-            child: Icon(Icons.keyboard_arrow_down,
-                size: isTablet ? 28 : 24, color: textColor),
+            behavior: HitTestBehavior.opaque,
+            onTap: () async {
+              await _textSearcher?.goToNextMatch();
+              _landOnCurrentMatch();
+            },
+            child: Padding(
+              padding: const EdgeInsets.all(4),
+              child: Icon(Icons.keyboard_arrow_down,
+                  size: isTablet ? 28 : 24, color: textColor),
+            ),
           ),
         ],
       ],
@@ -3992,6 +4431,50 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> {
 
   // ── Error / Loading views ─────────────────────────────────────────
 
+  void _closeReader() {
+    if (widget.embedded) {
+      widget.onClose?.call();
+    } else {
+      context.pop();
+    }
+  }
+
+  /// The toolbar (with its back button) only exists once the document is
+  /// open, and the reader's route has no swipe-back on iOS. Without this a
+  /// slow download, a long "preparing" phase or an error left no way out.
+  Widget _withCloseButton(
+      Widget child, bool isDark, Color textColor, bool isTablet) {
+    return Stack(
+      children: [
+        Positioned.fill(child: child),
+        Positioned(
+          top: 0,
+          left: 0,
+          child: SafeArea(
+            child: Padding(
+              padding: EdgeInsets.all(isTablet ? 16 : 12),
+              child: GestureDetector(
+                onTap: _closeReader,
+                child: Container(
+                  width: isTablet ? 44 : 36,
+                  height: isTablet ? 44 : 36,
+                  decoration: BoxDecoration(
+                    shape: BoxShape.circle,
+                    color: isDark
+                        ? AppColors.darkSurface
+                        : const Color(0xFFF5F5F5),
+                  ),
+                  child: Icon(widget.embedded ? Icons.close : Icons.arrow_back,
+                      size: isTablet ? 22 : 18, color: textColor),
+                ),
+              ),
+            ),
+          ),
+        ),
+      ],
+    );
+  }
+
   Widget _buildErrorView(bool isTablet, Color textColor) {
     return Center(
       child: Column(
@@ -4000,23 +4483,18 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> {
           Icon(Icons.error_outline,
               size: isTablet ? 64 : 48, color: Colors.grey),
           SizedBox(height: isTablet ? 21 : 16),
-          Text(_error!,
-              style:
-                  TextStyle(fontSize: isTablet ? 20 : 16, color: textColor)),
+          Padding(
+            padding: EdgeInsets.symmetric(horizontal: isTablet ? 48 : 32),
+            child: Text(_error!,
+                textAlign: TextAlign.center,
+                style: TextStyle(
+                    fontSize: isTablet ? 20 : 16,
+                    color: textColor,
+                    height: 1.35)),
+          ),
           SizedBox(height: isTablet ? 21 : 16),
           ElevatedButton(
-            onPressed: () {
-              setState(() {
-                _error = null;
-                _isLoading = true;
-                _isPdfReady = false;
-                _downloadProgress = 0;
-                _cachedPdfViewer = null;
-                _highlightsLoaded = false;
-                _bookmarksLoaded = false;
-              });
-              _loadPdf();
-            },
+            onPressed: _retryLoad,
             child: const Text('Retry'),
           ),
         ],

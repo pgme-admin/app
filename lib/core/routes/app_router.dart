@@ -718,9 +718,13 @@ class AppRouter {
               final documentId = state.uri.queryParameters['documentId'];
               final pdfUrl = state.uri.queryParameters['pdfUrl'];
               final title = state.uri.queryParameters['title'] ?? 'PDF Viewer';
+              // 'ebook' makes Retry fetch a fresh signed link from the ebook
+              // endpoint (the one in pdfUrl expires).
+              final source = state.uri.queryParameters['source'];
               return CustomTransitionPage(
                 key: state.pageKey,
-                child: PdfEnginePolicy.buildReader(documentId: documentId, pdfUrl: pdfUrl, title: title),
+                child: PdfEnginePolicy.buildReader(
+                    documentId: documentId, pdfUrl: pdfUrl, title: title, source: source),
                 transitionsBuilder: (context, animation, secondaryAnimation, child) {
                   return SlideTransition(
                     position: Tween<Offset>(

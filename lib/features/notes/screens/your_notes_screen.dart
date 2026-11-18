@@ -13,6 +13,7 @@ import 'package:pgme/core/services/api_service.dart';
 import 'package:pgme/core/services/dashboard_service.dart';
 import 'package:pgme/core/services/download_service.dart';
 import 'package:pgme/core/services/ebook_access_service.dart';
+import 'package:pgme/core/services/pdf_cache_service.dart';
 import 'package:pgme/core/utils/responsive_helper.dart';
 import 'package:pgme/core/widgets/app_dialog.dart';
 import 'package:pgme/features/home/providers/dashboard_provider.dart';
@@ -236,12 +237,26 @@ class _YourNotesScreenState extends State<YourNotesScreen> {
                 'documentId': item.documentId,
                 'pdfUrl': url,
                 'title': title,
+                'source': 'ebook',
               },
             );
           }
         }
       }
     } catch (e) {
+      // Offline: a PDF already on this device still opens (the reader falls
+      // back to it when the server can't be reached).
+      if (isNoConnectionError(e) &&
+          await PdfCacheService.isAvailableOffline(item.documentId)) {
+        if (mounted) {
+          context.pushNamed('pdf-viewer', queryParameters: {
+            'documentId': item.documentId,
+            'title': item.title,
+            'source': 'ebook',
+          });
+        }
+        return;
+      }
       if (mounted) {
         showAppDialog(context, message: 'Failed to open eBook: ${e.toString().replaceAll("Exception: ", "")}');
       }

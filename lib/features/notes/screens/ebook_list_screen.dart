@@ -10,6 +10,7 @@ import 'package:pgme/core/models/book_model.dart';
 import 'package:pgme/core/models/gateway_models.dart';
 import 'package:pgme/core/services/book_service.dart';
 import 'package:pgme/core/services/ebook_access_service.dart';
+import 'package:pgme/core/services/pdf_cache_service.dart';
 import 'package:pgme/core/widgets/gateway_widget.dart';
 import 'package:pgme/core/widgets/address_bottom_sheet.dart';
 import 'package:pgme/core/models/address_model.dart';
@@ -320,12 +321,26 @@ class _EbookListScreenState extends State<EbookListScreen>
                 'documentId': book.bookId,
                 'pdfUrl': url,
                 'title': title,
+                'source': 'ebook',
               },
             );
           }
         }
       }
     } catch (e) {
+      // Offline: a PDF already on this device still opens (the reader falls
+      // back to it when the server can't be reached).
+      if (isNoConnectionError(e) &&
+          await PdfCacheService.isAvailableOffline(book.bookId)) {
+        if (mounted) {
+          context.pushNamed('pdf-viewer', queryParameters: {
+            'documentId': book.bookId,
+            'title': book.title,
+            'source': 'ebook',
+          });
+        }
+        return;
+      }
       if (mounted) {
         _showError('Failed to open eBook: ${e.toString().replaceAll("Exception: ", "")}');
       }

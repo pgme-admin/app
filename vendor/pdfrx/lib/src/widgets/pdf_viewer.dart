@@ -446,6 +446,7 @@ class _PdfViewerState extends State<PdfViewer> with SingleTickerProviderStateMix
                         onInteractionStart: _onInteractionStart,
                         onInteractionUpdate: widget.params.onInteractionUpdate,
                         interactionEndFrictionCoefficient: widget.params.interactionEndFrictionCoefficient,
+                        allowInertia: widget.params.allowInteractionInertia,
                         onWheelDelta: widget.params.scrollByMouseWheel != null ? _onWheelDelta : null,
                         // PDF pages
                         child: CustomPaint(

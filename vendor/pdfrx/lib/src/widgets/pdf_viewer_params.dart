@@ -36,6 +36,7 @@ class PdfViewerParams {
     this.onInteractionStart,
     this.onInteractionUpdate,
     this.interactionEndFrictionCoefficient = _kDrag,
+    this.allowInteractionInertia,
     this.onDocumentChanged,
     this.calculateInitialPageNumber,
     this.calculateInitialZoom,
@@ -237,6 +238,10 @@ class PdfViewerParams {
 
   /// See [InteractiveViewer.interactionEndFrictionCoefficient] for details.
   final double interactionEndFrictionCoefficient;
+
+  /// PGME patch: see [InteractiveViewer.allowInertia]. Return false to skip
+  /// the fling after a gesture (the caller animates somewhere itself).
+  final bool Function(ScaleEndDetails details)? allowInteractionInertia;
 
   // Used as the coefficient of friction in the inertial translation animation.
   // This value was eyeballed to give a feel similar to Google Photos.
@@ -584,6 +589,7 @@ class PdfViewerParams {
         other.onInteractionStart == onInteractionStart &&
         other.onInteractionUpdate == onInteractionUpdate &&
         other.interactionEndFrictionCoefficient == interactionEndFrictionCoefficient &&
+        other.allowInteractionInertia == allowInteractionInertia &&
         other.onDocumentChanged == onDocumentChanged &&
         other.calculateInitialPageNumber == calculateInitialPageNumber &&
         other.calculateInitialZoom == calculateInitialZoom &&
@@ -638,6 +644,7 @@ class PdfViewerParams {
         onInteractionStart.hashCode ^
         onInteractionUpdate.hashCode ^
         interactionEndFrictionCoefficient.hashCode ^
+        allowInteractionInertia.hashCode ^
         onDocumentChanged.hashCode ^
         calculateInitialPageNumber.hashCode ^
         calculateInitialZoom.hashCode ^

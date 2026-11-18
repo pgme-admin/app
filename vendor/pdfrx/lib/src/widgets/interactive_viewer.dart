@@ -70,6 +70,7 @@ class InteractiveViewer extends StatefulWidget {
     this.maxScale = 8.0,
     this.minScale = 0.8,
     this.interactionEndFrictionCoefficient = _kDrag,
+    this.allowInertia,
     this.onInteractionEnd,
     this.onInteractionStart,
     this.onInteractionUpdate,
@@ -115,6 +116,7 @@ class InteractiveViewer extends StatefulWidget {
     this.maxScale = 8.0,
     this.minScale = 0.8,
     this.interactionEndFrictionCoefficient = _kDrag,
+    this.allowInertia,
     this.onInteractionEnd,
     this.onInteractionStart,
     this.onInteractionUpdate,
@@ -298,6 +300,12 @@ class InteractiveViewer extends StatefulWidget {
   ///
   /// Must be a finite number greater than zero.
   final double interactionEndFrictionCoefficient;
+
+  /// PGME patch: called when a pan or scale gesture ends, right after
+  /// [onInteractionEnd]. Returning false skips the momentum (fling) animation,
+  /// so the owner can animate to a position of its own (e.g. snap to a page)
+  /// without the fling fighting it. Null means momentum is always allowed.
+  final bool Function(ScaleEndDetails details)? allowInertia;
 
   /// Called when the user ends a pan or scale gesture on the widget.
   ///
@@ -786,6 +794,11 @@ class _InteractiveViewerState extends State<InteractiveViewer> with TickerProvid
     _scaleController.reset();
 
     if (!_gestureIsSupported(_gestureType)) {
+      _currentAxis = null;
+      return;
+    }
+
+    if (widget.allowInertia?.call(details) == false) {
       _currentAxis = null;
       return;
     }

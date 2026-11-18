@@ -1,3 +1,5 @@
+import 'dart:io';
+
 import 'package:dio/dio.dart';
 import 'package:flutter/foundation.dart';
 import 'package:pgme/core/constants/api_constants.dart';
@@ -126,13 +128,42 @@ class EbookAccessService {
       throw Exception('Failed to get ebook URL');
     } on DioException catch (e) {
       debugPrint('DioException getting ebook view URL: ${e.message}');
+      if (isNoConnectionError(e)) throw const NoConnectionException();
       if (e.response?.data != null && e.response?.data['message'] != null) {
         throw Exception(e.response?.data['message']);
       }
-      throw Exception('Network error: ${e.message}');
+      throw Exception("Couldn't reach the server. Please try again.");
     } catch (e) {
       debugPrint('Error getting ebook view URL: $e');
       rethrow;
     }
+  }
+}
+
+/// A request could not reach the server at all (offline, DNS failure,
+/// timeout), as opposed to the server refusing it. Callers can fall back to
+/// a copy already on the device.
+class NoConnectionException implements Exception {
+  const NoConnectionException();
+
+  @override
+  String toString() =>
+      'No internet connection. Check your connection and try again.';
+}
+
+/// True for [NoConnectionException] and Dio errors that never got a
+/// response from the server.
+bool isNoConnectionError(Object error) {
+  if (error is NoConnectionException) return true;
+  if (error is! DioException) return false;
+  if (error.error is SocketException) return true;
+  switch (error.type) {
+    case DioExceptionType.connectionError:
+    case DioExceptionType.connectionTimeout:
+    case DioExceptionType.sendTimeout:
+    case DioExceptionType.receiveTimeout:
+      return true;
+    default:
+      return false;
   }
 }

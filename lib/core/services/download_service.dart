@@ -59,16 +59,34 @@ class DownloadService {
     final downloadDio = Dio();
     downloadDio.options.receiveTimeout = const Duration(minutes: 30);
 
-    await downloadDio.download(
-      url,
-      filePath,
-      cancelToken: cancelToken,
-      onReceiveProgress: (received, total) {
-        if (total > 0) {
-          onProgress(received / total);
-        }
-      },
-    );
+    // Download to a temporary name and rename only once complete. Writing
+    // straight to the final name left a truncated file behind when the app
+    // was killed mid-download, and that file then counted as "downloaded"
+    // (and failed to open) for good.
+    final partPath = '$filePath.part';
+    final partFile = File(partPath);
+    try {
+      await downloadDio.download(
+        url,
+        partPath,
+        cancelToken: cancelToken,
+        onReceiveProgress: (received, total) {
+          if (total > 0) {
+            onProgress(received / total);
+          }
+        },
+      );
+      final finalFile = File(filePath);
+      if (await finalFile.exists()) await finalFile.delete();
+      await partFile.rename(filePath);
+    } catch (_) {
+      if (await partFile.exists()) {
+        try {
+          await partFile.delete();
+        } catch (_) {/* best-effort */}
+      }
+      rethrow;
+    }
 
     return filePath;
   }

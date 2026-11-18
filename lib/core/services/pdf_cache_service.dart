@@ -4,6 +4,7 @@ import 'dart:io';
 import 'package:dio/dio.dart';
 import 'package:flutter/foundation.dart';
 import 'package:path_provider/path_provider.dart';
+import 'package:pgme/core/services/download_service.dart';
 
 /// Durable on-device cache for downloaded PDF documents.
 ///
@@ -129,13 +130,22 @@ class PdfCacheService {
     final dir = await _cacheDir();
     final safeKey = _safeKey(cacheKey);
     final finalPath = '${dir.path}/$safeKey.pdf';
-    final tempPath = '${dir.path}/$safeKey.pdf.part';
+    // A temp name of its own per download: two opens of the same document
+    // (back out and reopen while the first download still runs) must not
+    // delete or rename each other's half-written file.
+    final tempPath =
+        '${dir.path}/$safeKey.${DateTime.now().microsecondsSinceEpoch}.part';
     final tempFile = File(tempPath);
-    if (await tempFile.exists()) {
-      await _safeDelete(tempFile);
-    }
 
-    final client = dio ?? Dio();
+    // Timeouts: connecting, and the gap between received chunks (Dio's
+    // receiveTimeout is per chunk, not the whole download, so big books on
+    // slow networks are fine). Without them a stalled connection left the
+    // progress frozen forever.
+    final client = dio ??
+        Dio(BaseOptions(
+          connectTimeout: const Duration(seconds: 20),
+          receiveTimeout: const Duration(seconds: 45),
+        ));
     try {
       await client.download(
         url,
@@ -178,6 +188,23 @@ class PdfCacheService {
     return finalFile;
   }
 
+  /// True when a PDF for [documentId] can be opened without the network:
+  /// an offline download (Your Notes) or a copy in this cache.
+  static Future<bool> isAvailableOffline(String documentId) async {
+    try {
+      final downloads = DownloadService();
+      if (await downloads.getDownloadedPath('ebook_$documentId.pdf') != null ||
+          await downloads.getDownloadedPath('doc_$documentId.pdf') != null) {
+        return true;
+      }
+      final dir = await _cacheDir();
+      final file = File('${dir.path}/${_safeKey(documentId)}.pdf');
+      return await file.exists() && await file.length() > 0;
+    } catch (_) {
+      return false;
+    }
+  }
+
   /// Removes the cached entry for [cacheKey] (both `.pdf` and any leftover
   /// `.part`). Use when a downstream consumer determines the cached file
   /// is corrupt — e.g. pdfium fails to parse it after a successful HTTP
@@ -187,7 +214,7 @@ class PdfCacheService {
       final dir = await _cacheDir();
       final safeKey = _safeKey(cacheKey);
       await _safeDelete(File('${dir.path}/$safeKey.pdf'));
-      await _safeDelete(File('${dir.path}/$safeKey.pdf.part'));
+      await _safeDelete(File('${dir.path}/$safeKey.pdf.part')); // older builds
     } catch (e) {
       debugPrint('[PdfCache] invalidate($cacheKey) error: $e');
     }
