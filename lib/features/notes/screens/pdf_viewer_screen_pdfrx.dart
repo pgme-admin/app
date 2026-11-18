@@ -3,6 +3,7 @@ import 'dart:io';
 import 'dart:math' as math;
 import 'package:dio/dio.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/scheduler.dart';
 import 'package:flutter/services.dart';
 import 'package:go_router/go_router.dart';
 import 'package:pdfrx/pdfrx.dart';
@@ -116,6 +117,10 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> {
   // Search
   PdfTextSearcher? _textSearcher;
   final TextEditingController _searchController = TextEditingController();
+  // The search field's `autofocus` never took effect: pdfrx's keyboard
+  // handler already holds focus, and autofocus only applies when nothing
+  // else is focused. Focus is requested explicitly when search opens.
+  final FocusNode _searchFocus = FocusNode();
 
   // Annotations — keyed by backend highlight_id
   final Map<String, _AnnotationData> _highlights = {};
@@ -242,7 +247,12 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> {
 
   int _pointersOnViewer = 0;
   int? _swipeFromPage;
-  double? _swipeFromY; // centre of the view (document units) at gesture start
+  // Finger position at the start and latest update of a gesture (screen
+  // units). Page turns follow the finger, not the view: at whole-page zoom
+  // pdfrx keeps the page from moving sideways, so a left/right swipe barely
+  // moved the view and never turned the page.
+  Offset? _swipeStartFinger;
+  Offset? _swipeLastFinger;
   bool _swipeScaled = false;
   // Set when a gesture ends in a page snap: tells pdfrx to skip its fling,
   // which would otherwise fight the snap animation.
@@ -256,6 +266,14 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> {
   int _settleSnaps = 0;
   // Fling speed (logical px/s) that turns a short swipe into a page turn.
   static const double _pageTurnFlingSpeed = 300;
+
+  // Shape of the page slots: the reader area with the toolbar hidden (the
+  // whole screen minus the status/home-indicator insets), from build(). Not
+  // the current viewer size: that changes whenever the toolbar, the search
+  // bar or the keyboard comes and goes, and re-laying out 1,500 pages
+  // mid-animation made pages jump to their neighbours and look doubled.
+  // A slot this tall also hides the neighbours in any shorter view.
+  double? _slotAspect;
 
   /// Size of the viewer area, or null before pdfrx has laid it out.
   Size? _viewerSize() {
@@ -337,11 +355,18 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> {
 
   int? _currentPageForPageView(
       Rect visible, List<Rect> pageRects, PdfViewerController controller) {
+    final mostVisible = _mostVisiblePage(visible, pageRects);
+    if (_pointersOnViewer > 0) return mostVisible;
     final anchor = _anchorPage;
-    if (_pointersOnViewer == 0 && anchor != null && anchor <= pageRects.length) {
-      return anchor;
+    if (anchor != null && anchor <= pageRects.length) return anchor;
+    // At rest without a remembered page (a long-press selection nudges the
+    // view and clears it, and no swipe-end snap follows a long-press): pin
+    // the page in view now, so a toolbar/search/keyboard resize that comes
+    // next re-centres on it instead of drifting to a neighbour.
+    if (mostVisible != null && _atPageZoom(mostVisible)) {
+      _anchorPage = mostVisible;
     }
-    return _mostVisiblePage(visible, pageRects);
+    return mostVisible;
   }
 
   void _onPageViewGestureStart(ScaleStartDetails details) {
@@ -350,11 +375,13 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> {
     _settleSnaps = 0;
     _snapOnGestureEnd = false;
     _swipeFromPage = _pdfController.pageNumber;
-    _swipeFromY = _pdfController.visibleRect.center.dy;
+    _swipeStartFinger = details.localFocalPoint;
+    _swipeLastFinger = details.localFocalPoint;
     _swipeScaled = false;
   }
 
   void _onPageViewGestureUpdate(ScaleUpdateDetails details) {
+    _swipeLastFinger = details.localFocalPoint;
     if (details.pointerCount > 1 || (details.scale - 1).abs() > 0.01) {
       _swipeScaled = true;
     }
@@ -364,26 +391,41 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> {
     _snapOnGestureEnd = false;
     if (widget.embedded || !_pdfController.isReady) return;
     final from = _swipeFromPage;
-    final fromY = _swipeFromY;
+    final fingerFrom = _swipeStartFinger;
+    final fingerTo = _swipeLastFinger;
     _swipeFromPage = null;
-    _swipeFromY = null;
+    _swipeStartFinger = null;
+    _swipeLastFinger = null;
     final current = _pdfController.pageNumber ?? from;
     // Zoomed in on a page: free panning (with momentum), no snapping.
     if (current == null || !_atPageZoom(current)) return;
     var target = current;
-    final fit = from == null ? null : _fitZoomOf(from);
     final view = _viewerSize();
-    if (!_swipeScaled && from != null && fromY != null && fit != null && view != null) {
-      final slotHeight = view.height / fit;
-      // + = moved towards later pages.
-      final moved = _pdfController.visibleRect.center.dy - fromY;
-      // - = finger moving up = towards later pages.
-      final vy = details.velocity.pixelsPerSecond.dy;
-      final slow = vy.abs() <= _pageTurnFlingSpeed;
-      if (vy < -_pageTurnFlingSpeed || (slow && moved > slotHeight * 0.15)) {
+    if (!_swipeScaled &&
+        from != null &&
+        fingerFrom != null &&
+        fingerTo != null &&
+        view != null) {
+      // Page turns follow the swipe, up/down or left/right (like a book):
+      // up or left = next page. A fling turns the page; a slow drag turns it
+      // past 15% of the view, otherwise it springs back.
+      final drag = fingerTo - fingerFrom; // screen units
+      final velocity = details.velocity.pixelsPerSecond;
+      final horizontal = velocity.distance > _pageTurnFlingSpeed
+          ? velocity.dx.abs() > velocity.dy.abs()
+          : drag.dx.abs() > drag.dy.abs();
+      // + = towards later pages (finger moving up / left).
+      final travel = horizontal ? -drag.dx : -drag.dy;
+      final span = horizontal ? view.width : view.height;
+      final speed = horizontal ? -velocity.dx : -velocity.dy;
+      // A fling only counts with some real travel, so a tap that slides a
+      // little never flips a page.
+      const minFlingTravel = 20.0;
+      if ((speed > _pageTurnFlingSpeed && travel >= minFlingTravel) ||
+          (speed.abs() <= _pageTurnFlingSpeed && travel > span * 0.15)) {
         target = from + 1;
-      } else if (vy > _pageTurnFlingSpeed ||
-          (slow && moved < -slotHeight * 0.15)) {
+      } else if ((speed < -_pageTurnFlingSpeed && travel <= -minFlingTravel) ||
+          (speed.abs() <= _pageTurnFlingSpeed && travel < -span * 0.15)) {
         target = from - 1;
       } else {
         target = from;
@@ -556,6 +598,7 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> {
     _textSearcher?.removeListener(_onSearchChanged);
     _textSearcher?.dispose();
     _searchController.dispose();
+    _searchFocus.dispose();
     // Dispose the pre-loaded document. We pass it to PdfViewer with
     // autoDispose: false so the viewer doesn't dispose it under us when
     // the widget rebuilds.
@@ -1248,6 +1291,29 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> {
       _currentSelectedText = null;
       _removeContextMenu();
     }
+    _syncBackState();
+  }
+
+  // True while a text selection or the annotation menu is open: Back then
+  // closes that instead of leaving the book (see build's PopScope). Kept in
+  // state so PopScope.canPop is right without rebuilding on every change.
+  bool _closableOnTop = false;
+
+  void _syncBackState() {
+    final active = _contextMenuOverlay != null ||
+        (_currentSelections != null && _currentSelections!.isNotEmpty);
+    if (active == _closableOnTop) return;
+    _closableOnTop = active;
+    if (!mounted) return;
+    // Selection callbacks can arrive during a frame; never setState there.
+    if (SchedulerBinding.instance.schedulerPhase ==
+        SchedulerPhase.persistentCallbacks) {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (mounted) setState(() {});
+      });
+    } else {
+      setState(() {});
+    }
   }
 
   void _showContextMenuFromSelection() {
@@ -1456,12 +1522,14 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> {
       ),
     );
     overlay.insert(_contextMenuOverlay!);
+    _syncBackState();
   }
 
   void _removeContextMenu() {
     _contextMenuDebounce?.cancel();
     _contextMenuOverlay?.remove();
     _contextMenuOverlay = null;
+    _syncBackState();
   }
 
   // ── Convert pdfrx selections to AnnotationTextBounds ───────────────
@@ -3384,6 +3452,11 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> {
 
   void _toggleSearch() {
     setState(() => _isSearchOpen = !_isSearchOpen);
+    if (_isSearchOpen) {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (mounted && _isSearchOpen) _searchFocus.requestFocus();
+      });
+    }
     if (!_isSearchOpen) {
       _textSearcher?.resetTextSearch();
       _searchController.clear();
@@ -3493,6 +3566,12 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> {
 
   @override
   Widget build(BuildContext context) {
+    final screen = MediaQuery.of(context);
+    final readerHeight =
+        screen.size.height - screen.padding.top - screen.padding.bottom;
+    if (readerHeight > 0 && screen.size.width > 0) {
+      _slotAspect = readerHeight / screen.size.width;
+    }
     final themeProvider = Provider.of<ThemeProvider>(context);
     final isDark = themeProvider.isDarkMode;
     final isTablet = ResponsiveHelper.isTablet(context);
@@ -3501,7 +3580,21 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> {
     final textColor = isDark ? AppColors.darkTextPrimary : Colors.black;
     final toolbarColor = isDark ? AppColors.darkCardBackground : Colors.white;
 
-    return Scaffold(
+    // Android Back (and the back gesture) first closes what is open on top
+    // of the page (annotation menu / selection, search bar), then leaves the
+    // book. With nothing open, Back pops normally (iOS swipe-back included).
+    // The pane beside a video leaves Back to that screen.
+    // Android: always intercepted and decided in _handleBack. A canPop that
+    // changes at runtime was not passed on to Android's predictive back on
+    // the emulator (Back with a selection open still left the book).
+    return PopScope(
+      canPop: widget.embedded ||
+          (!Platform.isAndroid && !_isSearchOpen && !_closableOnTop),
+      onPopInvokedWithResult: (didPop, _) {
+        if (didPop) return;
+        _handleBack();
+      },
+      child: Scaffold(
       key: _scaffoldKey,
       backgroundColor: backgroundColor,
       // Edge-swipe to open drawers is OFF. Otherwise Scaffold's
@@ -3635,6 +3728,7 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> {
                         ),
                       ],
                     ),
+      ),
     );
   }
 
@@ -3792,10 +3886,8 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> {
                     : estH,
               ),
           ];
-          final view = widget.embedded ? null : _viewerSize();
-          if (view != null && view.width > 0 && view.height > 0) {
-            return _layoutInPageSlots(sizes, view.height / view.width);
-          }
+          final aspect = widget.embedded ? null : _slotAspect;
+          if (aspect != null) return _layoutInPageSlots(sizes, aspect);
           double maxW = 0;
           for (final size in sizes) {
             if (size.width > maxW) maxW = size.width;
@@ -4239,7 +4331,7 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> {
         Expanded(
           child: TextField(
             controller: _searchController,
-            autofocus: true,
+            focusNode: _searchFocus,
             style: TextStyle(fontSize: isTablet ? 16 : 14, color: textColor),
             decoration: InputDecoration(
               hintText: 'Search text or page number',
@@ -4431,11 +4523,50 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> {
 
   // ── Error / Loading views ─────────────────────────────────────────
 
+  /// Back: annotation menu / text selection, then search bar, then an open
+  /// drawer, then the book itself.
+  void _handleBack() {
+    final hasSelection = _contextMenuOverlay != null ||
+        (_currentSelections != null && _currentSelections!.isNotEmpty);
+    if (hasSelection) {
+      _currentSelections = null;
+      _currentSelectedText = null;
+      _capturedBounds = null;
+      _capturedText = null;
+      _removeContextMenu();
+      _clearTextSelection();
+      return;
+    }
+    if (_isSearchOpen) {
+      _toggleSearch();
+      return;
+    }
+    final scaffold = _scaffoldKey.currentState;
+    if (scaffold != null && (scaffold.isDrawerOpen || scaffold.isEndDrawerOpen)) {
+      scaffold.closeDrawer();
+      scaffold.closeEndDrawer();
+      return;
+    }
+    _closeReader();
+  }
+
   void _closeReader() {
     if (widget.embedded) {
       widget.onClose?.call();
+      return;
+    }
+    // A plain pop (never maybePop: that would come back through the
+    // PopScope above and loop).
+    final router = GoRouter.maybeOf(context);
+    if (router != null && router.canPop()) {
+      router.pop();
+      return;
+    }
+    final navigator = Navigator.of(context);
+    if (navigator.canPop()) {
+      navigator.pop();
     } else {
-      context.pop();
+      SystemNavigator.pop();
     }
   }
 

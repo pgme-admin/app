@@ -1035,27 +1035,28 @@ class _EbookListScreenState extends State<EbookListScreen>
                       overflow: TextOverflow.ellipsis,
                     ),
 
-                    // Subject badge
+                    // Subject badge. Not Flexible: a Flexible here shared the
+                    // card's free space with the Spacer below, so cards with
+                    // a subject had their Read/Buy button lifted half-way up
+                    // and buttons in the same row did not line up.
                     if (book.subject != null) ...[
                       SizedBox(height: isTablet ? 4 : 3),
-                      Flexible(
-                        child: Container(
-                          padding: EdgeInsets.symmetric(horizontal: isTablet ? 7 : 5, vertical: 2),
-                          decoration: BoxDecoration(
-                            color: iconColor.withValues(alpha: 0.1),
-                            borderRadius: BorderRadius.circular(4),
+                      Container(
+                        padding: EdgeInsets.symmetric(horizontal: isTablet ? 7 : 5, vertical: 2),
+                        decoration: BoxDecoration(
+                          color: iconColor.withValues(alpha: 0.1),
+                          borderRadius: BorderRadius.circular(4),
+                        ),
+                        child: Text(
+                          book.subject!.name,
+                          style: TextStyle(
+                            fontFamily: 'Poppins',
+                            fontWeight: FontWeight.w500,
+                            fontSize: isTablet ? 10 : 9,
+                            color: iconColor,
                           ),
-                          child: Text(
-                            book.subject!.name,
-                            style: TextStyle(
-                              fontFamily: 'Poppins',
-                              fontWeight: FontWeight.w500,
-                              fontSize: isTablet ? 10 : 9,
-                              color: iconColor,
-                            ),
-                            maxLines: 1,
-                            overflow: TextOverflow.ellipsis,
-                          ),
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
                         ),
                       ),
                     ],
