@@ -138,6 +138,42 @@ class EpubReaderBridge {
     }
   }
 
+  /// The text line at (or, with [scan], first below) a normalized point:
+  /// its top and the distance to the next line, both as fractions of the
+  /// book view height. Null when there is no text there.
+  static Future<({double top, double pitch})?> lineAt(
+      EpubController controller, double x, double y,
+      {bool scan = false}) async {
+    try {
+      final raw = await controller.webViewController
+          ?.evaluateJavascript(
+              source: 'window.pgme ? window.pgme.lineAt($x, $y, $scan) : null')
+          .timeout(const Duration(milliseconds: 600));
+      final data = raw is String ? jsonDecode(raw) : raw;
+      if (data is! Map) return null;
+      final top = (data['top'] as num?)?.toDouble();
+      final pitch = (data['pitch'] as num?)?.toDouble();
+      if (top == null || pitch == null || pitch <= 0) return null;
+      return (top: top, pitch: pitch);
+    } catch (e) {
+      debugPrint('[EPUB] line lookup failed: $e');
+      return null;
+    }
+  }
+
+  /// Redraws highlights/underlines after the text was re-laid out.
+  static Future<void> refreshMarks(EpubController controller) {
+    return _call(controller, 'window.pgme && window.pgme.refreshMarks()');
+  }
+
+  /// Hides (or shows again) the image last returned by [tapAt] while it is
+  /// shown in the focus view.
+  static Future<void> setFocusedImageHidden(
+      EpubController controller, bool hidden) {
+    return _call(controller,
+        'window.pgme && window.pgme.setFocusedImageHidden($hidden)');
+  }
+
   /// Turns the page in the book (bypassing the turn-request hook).
   static Future<void> turn(EpubController controller, bool forward) {
     return _call(
@@ -215,9 +251,15 @@ class EpubReaderBridge {
       css += 'g.pgme-hl-' + name + '{fill:' + colours[name] +
         ' !important;fill-opacity:' + (dark ? '0.55' : '0.5') + ' !important;}';
     }
-    css += 'g.pgme-ul rect{fill:transparent !important;}' +
+    // epub.js draws each underline as a rect (hit area) plus a line, and
+    // puts the stroke on the group: without this the rect inherits it and
+    // shows as a box around the text. Only the line under the text is drawn.
+    css += 'g.pgme-ul rect, g.epubjs-ul rect{fill:transparent !important;' +
+      'stroke:none !important;stroke-width:0 !important;}' +
+      'g.pgme-ul, g.epubjs-ul{stroke:none !important;}' +
       'g.pgme-ul line{stroke:' + (dark ? '#8ABFFF' : '#1565C0') +
-      ' !important;stroke-width:2px !important;stroke-opacity:0.95 !important;}';
+      ' !important;stroke-width:2px !important;stroke-opacity:0.95 !important;' +
+      'stroke-linecap:round !important;}';
     style.textContent = css;
     return true;
   };
@@ -382,12 +424,74 @@ class EpubReaderBridge {
         if (box.width < 24 || box.height < 24) continue;
         var src = imageSource(image, doc);
         if (!src) continue;
+        pgme.focusedImage = image;
         return JSON.stringify({ kind: 'image', src: src,
           label: image.getAttribute('alt') || image.getAttribute('aria-label') || '',
           rect: normalized(box, fr) });
       }
     }
     return JSON.stringify({ kind: 'none' });
+  };
+
+  // Text line under a point (for the line guide). Uses the character box
+  // at the caret, then probes below it for the next line to get the line
+  // pitch (line spacing differs per book and setting).
+  function charBox(nx, ny) {
+    var x = nx * window.innerWidth, y = ny * window.innerHeight;
+    var contents = rendition.getContents();
+    for (var i = 0; i < contents.length; i++) {
+      var c = contents[i], doc = c.document, fr = frameRect(c);
+      if (!doc || !fr || !doc.caretRangeFromPoint) continue;
+      var lx = x - fr.left, ly = y - fr.top;
+      if (lx < 0 || ly < 0 || lx > fr.width || ly > fr.height) continue;
+      var caret = doc.caretRangeFromPoint(lx, ly);
+      if (!caret || !caret.startContainer || caret.startContainer.nodeType !== 3) continue;
+      var node = caret.startContainer;
+      var offset = Math.min(caret.startOffset, node.length - 1);
+      if (offset < 0) continue;
+      var r = doc.createRange();
+      r.setStart(node, offset);
+      r.setEnd(node, offset + 1);
+      var b = r.getBoundingClientRect();
+      if (!b.height || ly < b.top - 3 || ly > b.bottom + 3) continue;
+      return { top: b.top + fr.top, bottom: b.bottom + fr.top, height: b.height };
+    }
+    return null;
+  }
+  pgme.lineAt = function (nx, ny, scan) {
+    var h = window.innerHeight, box = null;
+    var limit = scan ? 0.6 : 0;
+    for (var d = 0; d <= limit && !box; d += 4 / h) {
+      box = charBox(nx, ny + d);
+      if (!box && scan) box = charBox(0.5, ny + d);
+    }
+    if (!box) return null;
+    var pitch = box.height * 1.35;
+    for (var y = box.bottom + 1; y < box.bottom + box.height * 2.5; y += 2) {
+      var next = charBox(nx, y / h) || charBox(0.5, y / h);
+      if (next && next.top > box.top + box.height * 0.5) {
+        pitch = next.top - box.top;
+        break;
+      }
+    }
+    return JSON.stringify({ top: box.top / h, pitch: pitch / h });
+  };
+
+  pgme.refreshMarks = function () {
+    try {
+      rendition.views().forEach(function (view) {
+        if (view && view.pane) view.pane.render();
+      });
+    } catch (e) {}
+    return true;
+  };
+
+  pgme.setFocusedImageHidden = function (hidden) {
+    var image = pgme.focusedImage;
+    if (!image) return false;
+    try { image.style.visibility = hidden ? 'hidden' : ''; } catch (e) {}
+    if (!hidden) pgme.focusedImage = null;
+    return true;
   };
 
   return true;

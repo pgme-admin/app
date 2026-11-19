@@ -95,6 +95,13 @@ class _EpubViewerScreenState extends State<EpubViewerScreen>
   bool _portraitLock = false;
   bool _lineGuide = false;
   double _guideDimming = 0.4;
+  int _guideLines = 2;
+  final EpubLineGuideController _guide = EpubLineGuideController();
+  bool _guideHint = false;
+  // Measured distance between text lines (px), for a window of whole lines.
+  double? _guidePitch;
+  Timer? _guideHintTimer;
+  Timer? _marksTimer;
 
   // Tapping the page hides/shows the header, progress row and bottom action
   // bar so the text gets the whole screen (matters most in landscape).
@@ -163,8 +170,9 @@ class _EpubViewerScreenState extends State<EpubViewerScreen>
   // Standalone notes (not attached to text), keyed by server id.
   final Map<String, Map<String, dynamic>> _standaloneNotes = {};
 
-  // Undo (Notes panel): annotation key or standalone note id.
-  String? _lastActionId;
+  // Undo (bottom bar + Notes panel), most recent last: annotation keys or
+  // standalone note ids, as in the PDF reader.
+  final List<String> _undoStack = [];
 
   Color get _readerAccent => readingThemeIsDark(_readingTheme,
           Provider.of<ThemeProvider>(context, listen: false).isDarkMode)
@@ -198,6 +206,9 @@ class _EpubViewerScreenState extends State<EpubViewerScreen>
   void dispose() {
     _readerTimeout?.cancel();
     _selectionCheckTimer?.cancel();
+    _guideHintTimer?.cancel();
+    _marksTimer?.cancel();
+    _guide.dispose();
     _downloadCancelToken?.cancel();
     if (_portraitLock) {
       unawaited(
@@ -233,6 +244,7 @@ class _EpubViewerScreenState extends State<EpubViewerScreen>
       _isDarkMode = readingThemeIsDark(theme, appDark);
       _portraitLock = prefs.getBool('epub_portrait_lock') ?? false;
       _lineGuide = prefs.getBool('epub_line_guide') ?? false;
+      _guideLines = (prefs.getInt('epub_guide_lines') ?? 2).clamp(1, 3).toInt();
       _guideDimming = (prefs.getDouble('epub_guide_dimming') ?? 0.4)
           .clamp(0.0, 0.7)
           .toDouble();
@@ -245,11 +257,24 @@ class _EpubViewerScreenState extends State<EpubViewerScreen>
     }
     if (_isEpubReady) {
       unawaited(_epubController.setFontSize(fontSize: _fontSize.toDouble()));
-      unawaited(_applySpread(_twoPageLayout));
+      _refreshMarksSoon();
+      unawaited(_applySpread(_wantsSpread(_bookViewSize)));
       unawaited(_applyReaderTheme());
     }
     if (modeChanged) _setReadingMode(savedScroll);
   }
+
+  /// Two facing pages, as in Apple Books on iPad: only on a tablet held in
+  /// landscape (two columns in portrait are too narrow to read), and only
+  /// when the reader has the option on.
+  bool _wantsSpread(Size? size) =>
+      _twoPageLayout &&
+      size != null &&
+      ResponsiveHelper.isTablet(context) &&
+      size.width > size.height &&
+      size.width >= 800;
+
+  bool get _isSpread => !_isScrollMode && _wantsSpread(_bookViewSize);
 
   Future<void> _applySpread(bool twoPages) async {
     // flutter_epub_viewer 1.2.8 passes the enum's toString() to epub.js;
@@ -324,6 +349,7 @@ class _EpubViewerScreenState extends State<EpubViewerScreen>
   }
 
   void _showAppearanceSettings() {
+    var guideTurnedOn = false;
     showEpubAppearanceSheet(
       context,
       fontSize: _fontSize,
@@ -345,13 +371,14 @@ class _EpubViewerScreenState extends State<EpubViewerScreen>
         setState(() => _fontSize = value);
         if (_isEpubReady) {
           unawaited(_epubController.setFontSize(fontSize: value.toDouble()));
+          _refreshMarksSoon();
         }
         SharedPreferences.getInstance()
             .then((prefs) => prefs.setInt('epub_font_size', value));
       },
       onTwoPageLayoutChanged: (value) {
         setState(() => _twoPageLayout = value);
-        if (_isEpubReady) unawaited(_applySpread(value));
+        if (_isEpubReady) unawaited(_applySpread(_wantsSpread(_bookViewSize)));
         SharedPreferences.getInstance()
             .then((prefs) => prefs.setBool('epub_two_page_layout', value));
       },
@@ -360,6 +387,7 @@ class _EpubViewerScreenState extends State<EpubViewerScreen>
       onReadingFontChanged: _setReadingFont,
       onLineSpacingChanged: (value) {
         setState(() => _lineSpacing = value);
+        _refreshMarksSoon();
         if (_isEpubReady) {
           unawaited(_applyReaderTheme());
         }
@@ -385,8 +413,16 @@ class _EpubViewerScreenState extends State<EpubViewerScreen>
             .then((prefs) => prefs.setDouble('epub_page_brightness', value));
       },
       onPortraitLockChanged: _setPortraitLock,
+      guideLines: _guideLines,
+      onGuideLinesChanged: (value) {
+        setState(() => _guideLines = value);
+        SharedPreferences.getInstance()
+            .then((prefs) => prefs.setInt('epub_guide_lines', value));
+      },
       onLineGuideChanged: (value) {
         setState(() => _lineGuide = value);
+        guideTurnedOn = value;
+        if (value) _moveGuideToTop();
         SharedPreferences.getInstance()
             .then((prefs) => prefs.setBool('epub_line_guide', value));
       },
@@ -395,7 +431,12 @@ class _EpubViewerScreenState extends State<EpubViewerScreen>
         SharedPreferences.getInstance()
             .then((prefs) => prefs.setDouble('epub_guide_dimming', value));
       },
-    );
+    ).then((_) {
+      // Shown once the sheet is out of the way.
+      if (mounted && guideTurnedOn && _lineGuide) {
+        unawaited(_showGuideHintOnce());
+      }
+    });
   }
 
   EpubTheme _currentReadingTheme() => epubReadingTheme(
@@ -411,10 +452,80 @@ class _EpubViewerScreenState extends State<EpubViewerScreen>
       if (mounted) {
         await applyEpubLinkContrast(_epubController, _isDarkMode);
         await EpubReaderBridge.setDark(_epubController, _isDarkMode);
+        _refreshMarksSoon();
       }
     } catch (e) {
       debugPrint('[EPUB] theme update unavailable: $e');
     }
+  }
+
+  /// Highlights and underlines are drawn over the text by position; after a
+  /// theme, font, size or spacing change re-lays out the text, redraw them
+  /// so they stay on their words.
+  void _refreshMarksSoon() {
+    _guidePitch = null;
+    _marksTimer?.cancel();
+    _marksTimer = Timer(const Duration(milliseconds: 300), () {
+      if (mounted) unawaited(EpubReaderBridge.refreshMarks(_epubController));
+    });
+  }
+
+  // ── Line guide ────────────────────────────────────────────────────
+
+  /// Reading window height: [_guideLines] lines at the current text size
+  /// and spacing, plus a little room.
+  double get _guideBandHeight {
+    final measured = _guidePitch;
+    if (measured != null) return _guideLines * measured + 2;
+    final pitch = measured ??
+        _fontSize *
+            switch (_lineSpacing) {
+              EpubLineSpacing.compact => 1.4,
+              EpubLineSpacing.relaxed => 1.75,
+              EpubLineSpacing.original => 1.5,
+            };
+    return _guideLines * pitch + 8;
+  }
+
+  /// Puts the reading window on the text line at (x, y) (normalized), or,
+  /// with [scan], on the first line below y. The window snaps to whole
+  /// lines like Apple Books' guide; without text there it centres on y.
+  Future<void> _moveGuideToLine(double x, double y, {bool scan = false}) async {
+    final height = _bookViewSize?.height ?? 0;
+    if (height <= 0) return;
+    final line = await EpubReaderBridge.lineAt(_epubController, x, y, scan: scan);
+    if (!mounted) return;
+    if (line == null) {
+      if (!scan) _guide.moveTo(y);
+      return;
+    }
+    final pitch = line.pitch * height;
+    if (_guidePitch == null || (pitch - _guidePitch!).abs() > 0.5) {
+      setState(() => _guidePitch = pitch);
+    }
+    final top = line.top * height - 3;
+    _guide.moveTo((top + _guideBandHeight / 2) / height);
+  }
+
+  void _moveGuideToTop() {
+    final height = _bookViewSize?.height ?? 0;
+    if (height <= 0) return;
+    _guide.moveTo((_guideBandHeight / 2 + 20) / height);
+    unawaited(_moveGuideToLine(0.2, 0.02, scan: true));
+  }
+
+  Future<void> _showGuideHintOnce() async {
+    final prefs = await SharedPreferences.getInstance();
+    if (!mounted || (prefs.getBool('epub_line_guide_hint_seen') ?? false)) {
+      return;
+    }
+    await prefs.setBool('epub_line_guide_hint_seen', true);
+    if (!mounted) return;
+    setState(() => _guideHint = true);
+    _guideHintTimer?.cancel();
+    _guideHintTimer = Timer(const Duration(seconds: 5), () {
+      if (mounted) setState(() => _guideHint = false);
+    });
   }
 
   void _setReadingTheme(EpubReadingTheme value) {
@@ -774,11 +885,18 @@ class _EpubViewerScreenState extends State<EpubViewerScreen>
     if (!mounted) return;
     final messenger = ScaffoldMessenger.of(context);
     messenger.hideCurrentSnackBar();
+    // Floats above the reader's bottom bar so it never covers Undo.
+    final media = MediaQuery.of(context);
+    final barHeight = _chromeVisible
+        ? (ResponsiveHelper.isTablet(context) ? 84.0 : 66.0) +
+            media.padding.bottom
+        : media.padding.bottom + 26;
     messenger.showSnackBar(SnackBar(
       content: Text(message),
       action: action,
       behavior: SnackBarBehavior.floating,
-      duration: const Duration(seconds: 4),
+      margin: EdgeInsets.fromLTRB(16, 0, 16, barHeight + 8),
+      duration: Duration(seconds: action == null ? 2 : 4),
     ));
   }
 
@@ -875,14 +993,15 @@ class _EpubViewerScreenState extends State<EpubViewerScreen>
     final existing = _annotations[key];
     if (existing != null) {
       if (existing.isHighlight) _setHighlightColor(existing, color);
-      setState(() => _lastActionId = key);
       return existing;
     }
     final a = EpubAnnotation(
         cfi: cfi, type: type, color: color, text: text, note: note);
     setState(() {
       _annotations[key] = a;
-      _lastActionId = key;
+      _undoStack
+        ..remove(key)
+        ..add(key);
     });
     _drawAnnotation(a);
     _sync(a, () => _postAnnotation(a));
@@ -908,7 +1027,7 @@ class _EpubViewerScreenState extends State<EpubViewerScreen>
       for (final a in list) {
         a.removed = true;
         _annotations.remove(a.key);
-        if (_lastActionId == a.key) _lastActionId = null;
+        _undoStack.remove(a.key);
       }
       _menu = null;
     });
@@ -1035,6 +1154,9 @@ class _EpubViewerScreenState extends State<EpubViewerScreen>
         setState(() => _menu = null);
         _editNote(primary);
       },
+      removeLabel: items.length > 1
+          ? 'Remove'
+          : (primary.isHighlight ? 'Remove Highlight' : 'Remove Underline'),
       onRemove: () => _removeAnnotations(items),
     );
   }
@@ -1071,22 +1193,30 @@ class _EpubViewerScreenState extends State<EpubViewerScreen>
   void _deleteStandaloneNote(String id) {
     setState(() {
       _standaloneNotes.remove(id);
-      if (_lastActionId == id) _lastActionId = null;
+      _undoStack.remove(id);
     });
     _highlightService.deleteHighlight(id).catchError((_) {});
   }
 
-  void _undoLast(StateSetter setSheetState) {
-    final id = _lastActionId;
-    if (id == null) return;
-    final a = _annotations[id];
-    if (a != null) {
-      _removeAnnotations([a], offerUndo: false);
-    } else if (_standaloneNotes.containsKey(id)) {
-      _deleteStandaloneNote(id);
+  /// Undoes the most recent highlight, underline or note (like the PDF
+  /// reader's Undo).
+  void _undoLast([StateSetter? setSheetState]) {
+    while (_undoStack.isNotEmpty) {
+      final id = _undoStack.removeLast();
+      final a = _annotations[id];
+      if (a != null) {
+        _removeAnnotations([a], offerUndo: false);
+        _showSnack(a.isHighlight ? 'Highlight undone' : 'Underline undone');
+        break;
+      }
+      if (_standaloneNotes.containsKey(id)) {
+        _deleteStandaloneNote(id);
+        _showSnack('Note undone');
+        break;
+      }
     }
-    _lastActionId = null;
-    setSheetState(() {});
+    if (mounted) setState(() {});
+    setSheetState?.call(() {});
   }
 
   // ── Notes panel ───────────────────────────────────────────────────
@@ -1143,7 +1273,7 @@ class _EpubViewerScreenState extends State<EpubViewerScreen>
                               fontSize: 18,
                               color: textColor)),
                       const Spacer(),
-                      if (_lastActionId != null)
+                      if (_undoStack.isNotEmpty)
                         _headerButton('Undo', Icons.undo, AppColors.error,
                             () => _undoLast(setSheetState)),
                       const SizedBox(width: 6),
@@ -1497,7 +1627,7 @@ class _EpubViewerScreenState extends State<EpubViewerScreen>
       if (!mounted) return;
       setState(() {
         _standaloneNotes[id] = {'note': note};
-        _lastActionId = id;
+        _undoStack.add(id);
       });
       setSheetState(() {});
     } catch (_) {
@@ -1604,11 +1734,13 @@ class _EpubViewerScreenState extends State<EpubViewerScreen>
                         minHeight: 2),
                   ),
                 ])
-              // Hidden: keep only the status-bar inset so text never sits
-              // under the clock.
-              : SizedBox(
-                  width: double.infinity,
-                  height: MediaQuery.of(context).padding.top),
+              // Hidden (immersive, as in Apple Books): just the book title
+              // under the status bar.
+              : _immersiveBar(
+                  top: true,
+                  text: widget.title,
+                  inset: MediaQuery.of(context).padding.top,
+                  isDark: isDark),
           Expanded(
               child: _error != null
                   ? _buildError(textColor, isTablet)
@@ -1624,10 +1756,50 @@ class _EpubViewerScreenState extends State<EpubViewerScreen>
                   maintainState: true,
                   child: _buildBottomActionBar(isDark, isTablet),
                 )
-              : SizedBox(
-                  width: double.infinity,
-                  height: MediaQuery.of(context).padding.bottom),
+              // Hidden: where you are in the chapter.
+              : _immersiveBar(
+                  top: false,
+                  text: !_isEpubReady
+                      ? ''
+                      : !_isScrollMode && _sectionPagesLeft != null
+                          ? (_sectionPagesLeft == 0
+                              ? 'Last page in chapter · ${(_readProgress * 100).toInt()}%'
+                              : '${_sectionPagesLeft!} ${_sectionPagesLeft == 1 ? 'page' : 'pages'} left in chapter · ${(_readProgress * 100).toInt()}%')
+                          : '${(_readProgress * 100).toInt()}%',
+                  inset: MediaQuery.of(context).padding.bottom,
+                  isDark: isDark),
         ]),
+      ),
+    );
+  }
+
+  /// Title / position line shown while the reader controls are hidden.
+  Widget _immersiveBar({
+    required bool top,
+    required String text,
+    required double inset,
+    required bool isDark,
+  }) {
+    const height = 26.0;
+    final label = Text(text,
+        maxLines: 1,
+        overflow: TextOverflow.ellipsis,
+        textAlign: TextAlign.center,
+        style: TextStyle(
+            fontSize: 11.5,
+            fontWeight: FontWeight.w500,
+            letterSpacing: 0.2,
+            color: isDark ? AppColors.darkTextTertiary : Colors.grey[500]));
+    return SizedBox(
+      width: double.infinity,
+      height: inset + height,
+      child: Padding(
+        padding: EdgeInsets.only(
+            top: top ? inset : 0,
+            bottom: top ? 0 : inset,
+            left: 48,
+            right: 48),
+        child: Center(child: label),
       ),
     );
   }
@@ -1710,6 +1882,18 @@ class _EpubViewerScreenState extends State<EpubViewerScreen>
       case 'link':
         break;
       default:
+        // Line guide on: a tap outside the reading window moves it to the
+        // tapped line (Apple Books-style); inside it shows/hides controls.
+        final height = _bookViewSize?.height ?? 0;
+        if (_lineGuide && height > 0) {
+          final band = EpubLineGuide.bandRect(
+              _guide.value, _guideBandHeight, _bookViewSize!);
+          if (!band.contains(Offset(band.center.dx, y * height))) {
+            if (_guideHint) setState(() => _guideHint = false);
+            unawaited(_moveGuideToLine(x, y));
+            return;
+          }
+        }
         setState(() {
           _menu = null;
           _chromeVisible = !_chromeVisible;
@@ -1740,10 +1924,15 @@ class _EpubViewerScreenState extends State<EpubViewerScreen>
             o.dy + r.top * size.height, r.width * size.width,
             r.height * size.height);
       }
+      // The image leaves the page while it is focused, as in Apple Books,
+      // and returns to the same spot on the same page when closed.
+      await EpubReaderBridge.setFocusedImageHidden(_epubController, true);
+      if (!mounted) return;
       await showEpubImageFocus(context,
           bytes: bytes, origin: origin, label: target.label);
     } finally {
       _imageFocused = false;
+      unawaited(EpubReaderBridge.setFocusedImageHidden(_epubController, false));
     }
   }
 
@@ -1769,7 +1958,10 @@ class _EpubViewerScreenState extends State<EpubViewerScreen>
     _turning = true;
     final generation = _viewerGeneration;
     final startCfi = _currentCfi;
-    final style = _pageTurn == EpubPageTurn.curl && _curlProgram == null
+    // Curl turns one sheet; in a two-page spread both pages would bend as
+    // one, so spreads slide instead.
+    final style = _pageTurn == EpubPageTurn.curl &&
+            (_curlProgram == null || _isSpread)
         ? EpubPageTurn.slide
         : _pageTurn;
     final animate =
@@ -1791,6 +1983,10 @@ class _EpubViewerScreenState extends State<EpubViewerScreen>
       await EpubReaderBridge.turn(_epubController, forward);
       final newCfi = await relocated.future
           .timeout(const Duration(milliseconds: 900), onTimeout: () => null);
+      // A new page starts reading at the top.
+      if (mounted && _lineGuide && newCfi != null && newCfi != startCfi) {
+        _moveGuideToTop();
+      }
       // First/last page or a failed turn: nothing to animate.
       if (current == null ||
           !mounted ||
@@ -2186,6 +2382,17 @@ class _EpubViewerScreenState extends State<EpubViewerScreen>
                 _showNotesPanel,
                 isDark,
                 isTablet),
+            // Undo — always visible, as in the PDF reader: red with a count
+            // when something can be undone, muted otherwise.
+            _bottomAction(
+                Icons.undo,
+                _undoStack.isEmpty ? 'Undo' : 'Undo (${_undoStack.length})',
+                _undoStack.isEmpty
+                    ? (isDark ? AppColors.darkTextSecondary : Colors.grey)
+                    : AppColors.error,
+                _undoStack.isEmpty ? () {} : () => _undoLast(),
+                isDark,
+                isTablet),
             _bottomAction(Icons.text_fields, 'Text', _readerAccent,
                 _showAppearanceSettings, isDark, isTablet),
             _bottomAction(Icons.menu_book_outlined, 'Contents', _readerAccent,
@@ -2270,7 +2477,7 @@ class _EpubViewerScreenState extends State<EpubViewerScreen>
           initialCfi: _resumeCfi,
           displaySettings: EpubDisplaySettings(
               fontSize: _fontSize,
-              spread: _twoPageLayout && ResponsiveHelper.isTablet(context)
+              spread: _wantsSpread(constraints.biggest)
                   ? EpubSpread.auto
                   : EpubSpread.none,
               flow: _isScrollMode ? EpubFlow.scrolled : EpubFlow.paginated,
@@ -2414,7 +2621,15 @@ class _EpubViewerScreenState extends State<EpubViewerScreen>
         if (_isEpubReady && _lineGuide)
           Positioned.fill(
               child: EpubLineGuide(
-                  dimming: _guideDimming, accentColor: _readerAccent)),
+                  controller: _guide,
+                  dimming: _guideDimming,
+                  accentColor: _readerAccent,
+                  bandHeight: _guideBandHeight,
+                  stepHeight: _guidePitch == null
+                      ? null
+                      : _guideLines * _guidePitch!,
+                  dark: isDark,
+                  showHint: _guideHint)),
         if (_isEpubReady && _menu != null)
           _buildMenu(_menu!, constraints.biggest, isDark),
         if (!_isEpubReady)
@@ -2477,6 +2692,12 @@ class _EpubViewerScreenState extends State<EpubViewerScreen>
     final previous = _bookViewSize;
     _bookViewSize = size;
     if (previous == null || previous == size || !_isEpubReady) return;
+    if (_wantsSpread(previous) != _wantsSpread(size)) {
+      final spread = _wantsSpread(size);
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (mounted) unawaited(_applySpread(spread));
+      });
+    }
     // A menu anchored to the old layout would point at the wrong text.
     if (_menu != null) {
       WidgetsBinding.instance.addPostFrameCallback((_) {

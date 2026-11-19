@@ -28,6 +28,7 @@ class EpubAnnotationMenu extends StatelessWidget {
     this.onNote,
     this.hasNote = false,
     this.onRemove,
+    this.removeLabel,
   });
 
   final Rect anchor;
@@ -42,10 +43,25 @@ class EpubAnnotationMenu extends StatelessWidget {
   final bool hasNote;
   final VoidCallback? onRemove;
 
+  /// Shown next to the remove icon ("Remove Highlight"), as in the PDF
+  /// reader. Icon only when null.
+  final String? removeLabel;
+
   static const double _height = 52;
 
   @override
   Widget build(BuildContext context) {
+    // Full label ("Remove Highlight") when it fits, else "Remove".
+    final fixed = 16.0 +
+        epubHighlightColors.length * 40 +
+        9 +
+        (onUnderline != null ? 44 : 0) +
+        (onNote != null ? 44 : 0);
+    String? label = removeLabel;
+    if (label != null &&
+        fixed + _RemoveButton.widthFor(label) > area.width - 16) {
+      label = 'Remove';
+    }
     final actions = <Widget>[
       for (final entry in epubHighlightColors.entries)
         _ColorDot(
@@ -78,16 +94,21 @@ class EpubAnnotationMenu extends StatelessWidget {
           onTap: onNote!,
         ),
       if (onRemove != null)
-        _MenuIcon(
-          icon: Icons.delete_outline,
-          tooltip: 'Remove',
-          color: const Color(0xFFE5484D),
-          onTap: onRemove!,
-        ),
+        label == null
+            ? _MenuIcon(
+                icon: Icons.delete_outline,
+                tooltip: 'Remove',
+                color: const Color(0xFFE5484D),
+                onTap: onRemove!,
+              )
+            : _RemoveButton(label: label, onTap: onRemove!),
     ];
-    final width = 16.0 +
-        epubHighlightColors.length * 40 +
-        (actions.length - epubHighlightColors.length) * 44;
+    final width = fixed +
+        (onRemove == null
+            ? 0
+            : label == null
+                ? 44
+                : _RemoveButton.widthFor(label));
     final menuWidth = width.clamp(0.0, area.width - 16).toDouble();
     final left = (anchor.center.dx - menuWidth / 2)
         .clamp(8.0, (area.width - menuWidth - 8).clamp(8.0, double.infinity))
@@ -200,6 +221,46 @@ class _MenuIcon extends StatelessWidget {
         radius: 22,
         child: SizedBox(
             width: 44, height: 52, child: Icon(icon, size: 22, color: color)),
+      ),
+    );
+  }
+}
+
+class _RemoveButton extends StatelessWidget {
+  const _RemoveButton({required this.label, required this.onTap});
+
+  static double widthFor(String label) => 4 + 20 + 18 + 4 + label.length * 7.4;
+
+  final String label;
+  final VoidCallback onTap;
+
+  @override
+  Widget build(BuildContext context) {
+    const red = Color(0xFFE5484D);
+    return Semantics(
+      button: true,
+      label: label,
+      child: InkWell(
+        onTap: onTap,
+        borderRadius: BorderRadius.circular(18),
+        child: Container(
+          height: 36,
+          margin: const EdgeInsets.only(left: 4),
+          padding: const EdgeInsets.symmetric(horizontal: 10),
+          decoration: BoxDecoration(
+            color: red.withValues(alpha: 0.12),
+            borderRadius: BorderRadius.circular(18),
+          ),
+          child: Row(mainAxisSize: MainAxisSize.min, children: [
+            const Icon(Icons.delete_outline, size: 18, color: red),
+            const SizedBox(width: 4),
+            ExcludeSemantics(
+              child: Text(label,
+                  style: const TextStyle(
+                      fontSize: 13, fontWeight: FontWeight.w600, color: red)),
+            ),
+          ]),
+        ),
       ),
     );
   }

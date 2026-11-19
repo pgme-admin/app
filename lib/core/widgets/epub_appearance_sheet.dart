@@ -14,6 +14,8 @@ Future<void> showEpubAppearanceSheet(
   required double pageBrightness,
   required bool lineGuide,
   required double guideDimming,
+  int guideLines = 2,
+  ValueChanged<int>? onGuideLinesChanged,
   required EpubReadingTheme readingTheme,
   required EpubReadingFont readingFont,
   required EpubLineSpacing lineSpacing,
@@ -40,6 +42,7 @@ Future<void> showEpubAppearanceSheet(
   var brightness = pageBrightness;
   var guide = lineGuide;
   var dimming = guideDimming;
+  var lines = guideLines;
   var palette = readingTheme;
   var font = readingFont;
   var spacing = lineSpacing;
@@ -290,7 +293,9 @@ Future<void> showEpubAppearanceSheet(
                           SwitchListTile.adaptive(
                             contentPadding: EdgeInsets.zero,
                             title: const Text('Line guide'),
-                            subtitle: const Text('Highlight one reading band'),
+                            subtitle: const Text(
+                                'Keeps your eyes on a few lines and dims the '
+                                'rest. Tap any line to move it there.'),
                             activeTrackColor: accentColor,
                             value: guide,
                             onChanged: (value) {
@@ -299,7 +304,24 @@ Future<void> showEpubAppearanceSheet(
                             },
                           ),
                           if (guide) ...[
-                            const Text('Background dimming'),
+                            const SizedBox(height: 4),
+                            const Text('Guide height'),
+                            const SizedBox(height: 8),
+                            Wrap(spacing: 8, children: [
+                              for (final n in const [1, 2, 3])
+                                ChoiceChip(
+                                  label: Text(n == 1 ? '1 line' : '$n lines'),
+                                  selected: lines == n,
+                                  selectedColor:
+                                      accentColor.withValues(alpha: 0.15),
+                                  onSelected: (_) {
+                                    updateSheet(() => lines = n);
+                                    onGuideLinesChanged?.call(n);
+                                  },
+                                ),
+                            ]),
+                            const SizedBox(height: 12),
+                            const Text('Dim outside the guide'),
                             Slider(
                               value: dimming,
                               min: 0,
