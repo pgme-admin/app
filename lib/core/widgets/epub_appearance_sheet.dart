@@ -223,13 +223,19 @@ Future<void> showEpubAppearanceSheet(
                           const SizedBox(height: 8),
                           Wrap(spacing: 8, runSpacing: 8, children: [
                             for (final (value, label, icon) in [
-                              (EpubPageTurn.slide, 'Pages', Icons.swipe),
-                              if (supportsAnimatedPageTurns)
+                              (EpubPageTurn.slide, 'Slide', Icons.swipe),
+                              if (supportsAnimatedPageTurns) ...[
+                                (
+                                  EpubPageTurn.curl,
+                                  'Curl',
+                                  Icons.auto_stories
+                                ),
                                 (
                                   EpubPageTurn.fastFade,
                                   'Fast fade',
                                   Icons.blur_on
                                 ),
+                              ],
                             ])
                               ChoiceChip(
                                 label: Text(label),

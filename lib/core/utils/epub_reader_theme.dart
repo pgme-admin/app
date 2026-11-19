@@ -7,7 +7,8 @@ enum EpubReadingFont { original, serif, sans }
 
 enum EpubLineSpacing { original, compact, relaxed }
 
-enum EpubPageTurn { slide, fastFade }
+/// How a page turns in paginated mode (Apple Books: Slide, Curl, Fast Fade).
+enum EpubPageTurn { slide, curl, fastFade }
 
 EpubReadingTheme readingThemeFromName(String? name) =>
     EpubReadingTheme.values.firstWhere(

@@ -1,11 +1,14 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
+import 'dart:ui' as ui;
 
 import 'package:dio/dio.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_epub_viewer/flutter_epub_viewer.dart';
+import 'package:flutter_inappwebview/flutter_inappwebview.dart'
+    show ScreenshotConfiguration, CompressFormat;
 import 'package:go_router/go_router.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:provider/provider.dart';
@@ -17,12 +20,16 @@ import 'package:pgme/core/services/api_service.dart';
 import 'package:pgme/core/services/storage_service.dart';
 import 'package:pgme/core/constants/api_constants.dart';
 import 'package:pgme/core/utils/epub_file.dart';
-import 'package:pgme/core/utils/epub_image_zoom.dart';
+import 'package:pgme/core/utils/epub_annotation.dart';
+import 'package:pgme/core/utils/epub_reader_bridge.dart';
 import 'package:pgme/core/utils/epub_search.dart';
 import 'package:pgme/core/utils/epub_reader_theme.dart';
 import 'package:pgme/core/widgets/epub_line_guide.dart';
 import 'package:pgme/core/widgets/epub_appearance_sheet.dart';
 import 'package:pgme/core/widgets/epub_navigation_sheet.dart';
+import 'package:pgme/core/widgets/epub_annotation_menu.dart';
+import 'package:pgme/core/widgets/epub_image_focus.dart';
+import 'package:pgme/core/widgets/epub_page_curl.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:pgme/core/services/highlight_service.dart';
 import 'package:pgme/core/theme/app_theme.dart';
@@ -47,8 +54,17 @@ class EpubViewerScreen extends StatefulWidget {
   State<EpubViewerScreen> createState() => _EpubViewerScreenState();
 }
 
+/// The floating annotation menu: over a text selection ([keys] empty) or
+/// over tapped annotations ([keys] = their EpubAnnotation keys).
+class _ReaderMenu {
+  const _ReaderMenu(this.rect, this.keys);
+  final Rect rect;
+  final List<String> keys;
+  bool get forSelection => keys.isEmpty;
+}
+
 class _EpubViewerScreenState extends State<EpubViewerScreen>
-    with SingleTickerProviderStateMixin {
+    with TickerProviderStateMixin {
   final EpubController _epubController = EpubController();
   final HighlightService _highlightService = HighlightService();
   final BookmarkService _bookmarkService = BookmarkService();
@@ -83,8 +99,11 @@ class _EpubViewerScreenState extends State<EpubViewerScreen>
   // Tapping the page hides/shows the header, progress row and bottom action
   // bar so the text gets the whole screen (matters most in landscape).
   bool _chromeVisible = true;
+  // An image is being opened or shown in the focus view.
   bool _imageFocused = false;
-  Timer? _chromeTapTimer;
+  Timer? _selectionCheckTimer;
+  final GlobalKey _bookKey = GlobalKey();
+  _ReaderMenu? _menu;
   // Touch tracking from the book's own onTouchDown/onTouchUp callbacks
   // (normalized 0..1 coordinates). Used for tap-to-toggle chrome and, on iOS,
   // swipe-to-turn-page.
@@ -101,14 +120,27 @@ class _EpubViewerScreenState extends State<EpubViewerScreen>
   String? _resumeCfi;
   int _jumpSerial = 0;
 
-  // A short fade is drawn in Flutter; it never captures the book's WebView.
-  late final AnimationController _pageFade = AnimationController(
-      vsync: this,
-      duration: const Duration(milliseconds: 90),
-      reverseDuration: const Duration(milliseconds: 90));
+  // Page turns (see _turnPage). The book is a web view that Flutter cannot
+  // move or bend, so a turn is drawn with stills of the page laid over it.
+  late final AnimationController _turnAnim = AnimationController(vsync: this);
+  late final Animation<double> _turnCurve =
+      CurvedAnimation(parent: _turnAnim, curve: Curves.easeInOut);
+  ui.FragmentProgram? _curlProgram;
+  ui.Image? _turnCover; // still under the moving page
+  ui.Image? _turnImage; // the page that moves
+  EpubPageTurn _turnStyle = EpubPageTurn.slide;
   bool _turning = false;
   bool? _queuedTurnForward;
   Completer<String?>? _turnRelocated;
+  bool _atStart = false;
+  bool _atEnd = false;
+  // Web view stills: verified once per book; after repeated failures (e.g.
+  // a device that returns blank stills) pages turn without animation.
+  bool _snapshotsVerified = false;
+  int _blankSnapshots = 0;
+  int _snapshotFailures = 0;
+  bool get _snapshotsUnavailable =>
+      _blankSnapshots >= 2 || _snapshotFailures >= 2;
 
   // Current selection
   String? _selectedCfi;
@@ -125,14 +157,13 @@ class _EpubViewerScreenState extends State<EpubViewerScreen>
   bool _isCurrentLocationBookmarked = false;
   String? _currentBookmarkId;
 
-  // Highlights — id -> {cfi, text, color}
-  final Map<String, Map<String, String>> _highlights = {};
-  // Underlines — id -> {cfi, text}
-  final Map<String, Map<String, String>> _underlines = {};
-  // Standalone notes
+  // Highlights and underlines, keyed by EpubAnnotation.key, in the order
+  // they were made.
+  final Map<String, EpubAnnotation> _annotations = {};
+  // Standalone notes (not attached to text), keyed by server id.
   final Map<String, Map<String, dynamic>> _standaloneNotes = {};
 
-  // Undo
+  // Undo (Notes panel): annotation key or standalone note id.
   String? _lastActionId;
 
   Color get _readerAccent => readingThemeIsDark(_readingTheme,
@@ -160,19 +191,22 @@ class _EpubViewerScreenState extends State<EpubViewerScreen>
     });
     _loadAppearance();
     _loadEpub();
+    PageCurl.load().then((program) => _curlProgram = program);
   }
 
   @override
   void dispose() {
     _readerTimeout?.cancel();
-    _chromeTapTimer?.cancel();
+    _selectionCheckTimer?.cancel();
     _downloadCancelToken?.cancel();
     if (_portraitLock) {
       unawaited(
           SystemChrome.setPreferredOrientations(_defaultReaderOrientations()));
     }
     _reanchorTimer?.cancel();
-    _pageFade.dispose();
+    _turnAnim.dispose();
+    _turnCover?.dispose();
+    _turnImage?.dispose();
     super.dispose();
   }
 
@@ -229,9 +263,10 @@ class _EpubViewerScreenState extends State<EpubViewerScreen>
   }
 
   Future<void> _showNavigation() async {
+    _clearSelection();
     final cfi =
         await showEpubNavigationSheet(context, _chapters, _bookmarkCfis);
-    if (mounted && cfi != null) _epubController.display(cfi: cfi);
+    if (mounted && cfi != null) _displayCfi(cfi);
   }
 
   /// epub.js knows the displayed page count for the current spine section.
@@ -251,7 +286,8 @@ class _EpubViewerScreenState extends State<EpubViewerScreen>
               : null;
             return JSON.stringify({cfi: rendition.location.start.cfi,
               page: end.displayed.page, total: end.displayed.total,
-              progress: progress, atStart: rendition.location.atStart === true});
+              progress: progress, atStart: rendition.location.atStart === true,
+              atEnd: rendition.location.atEnd === true});
           })()''');
       if (!mounted || cfi != _currentCfi || result == null) return;
       final data = result is String ? jsonDecode(result) : result;
@@ -267,6 +303,8 @@ class _EpubViewerScreenState extends State<EpubViewerScreen>
           : null;
       final useProgress = progress != null &&
           (progress > 0 || _readProgress == 0 || data['atStart'] == true);
+      _atStart = data['atStart'] == true;
+      _atEnd = data['atEnd'] == true;
       if (_sectionPagesLeft != remaining ||
           (useProgress && _readProgress != progress)) {
         setState(() {
@@ -290,7 +328,7 @@ class _EpubViewerScreenState extends State<EpubViewerScreen>
       context,
       fontSize: _fontSize,
       isTablet: ResponsiveHelper.isTablet(context),
-      supportsAnimatedPageTurns: Platform.isIOS,
+      supportsAnimatedPageTurns: true,
       twoPageLayout: _twoPageLayout,
       isScrollMode: _isScrollMode,
       portraitLock: _portraitLock,
@@ -372,6 +410,7 @@ class _EpubViewerScreenState extends State<EpubViewerScreen>
       await _epubController.updateTheme(theme: _currentReadingTheme());
       if (mounted) {
         await applyEpubLinkContrast(_epubController, _isDarkMode);
+        await EpubReaderBridge.setDark(_epubController, _isDarkMode);
       }
     } catch (e) {
       debugPrint('[EPUB] theme update unavailable: $e');
@@ -467,21 +506,36 @@ class _EpubViewerScreenState extends State<EpubViewerScreen>
         !_chaptersReady ||
         !_pageDisplayed) return;
     _readerTimeout?.cancel();
-    setState(() => _isEpubReady = true);
-    if (_dataLoaded) {
-      _reapplyAnnotations();
-    } else {
-      _loadData();
-    }
+    setState(() {
+      _isEpubReady = true;
+      _hasSelection = false;
+      _menu = null;
+    });
     _applyBookLayoutFixes();
     unawaited(applyEpubLinkContrast(_epubController, _isDarkMode).catchError(
         (Object e) => debugPrint('[EPUB] link contrast unavailable: $e')));
-    unawaited(installEpubImageZoom(_epubController, onFocusChanged: (open) {
-      if (!mounted) return;
-      if (open) _chromeTapTimer?.cancel();
-      setState(() => _imageFocused = open);
-    }).catchError(
-        (Object e) => debugPrint('[EPUB] Image zoom unavailable: $e')));
+    unawaited(_prepareReaderPage(_viewerGeneration));
+  }
+
+  /// Installs the reader helpers into the freshly loaded book page, then
+  /// draws the saved annotations (loading them the first time).
+  Future<void> _prepareReaderPage(int generation) async {
+    try {
+      await EpubReaderBridge.install(_epubController,
+          dark: _isDarkMode,
+          onTurnRequest: (forward) {
+            if (mounted && generation == _viewerGeneration) {
+              unawaited(_turnPage(forward: forward));
+            }
+          });
+    } catch (e) {
+      debugPrint('[EPUB] reader helpers unavailable: $e');
+    }
+    if (!mounted || generation != _viewerGeneration) return;
+    // Annotations already in memory (made before a reload, or loaded) first,
+    // then the saved ones the first time.
+    _reapplyAnnotations();
+    if (!_dataLoaded) await _loadData();
   }
 
   // ── EPUB loading ──────────────────────────────────────────────────
@@ -586,29 +640,47 @@ class _EpubViewerScreenState extends State<EpubViewerScreen>
     try {
       final highlights =
           await _highlightService.getHighlights(widget.documentId!);
+      if (!mounted) return;
       for (final h in highlights) {
-        final id = h['highlight_id'] as String;
+        final id = h['highlight_id'] as String?;
+        if (id == null) continue;
         final type = (h['annotation_type'] as String?) ?? 'highlight';
+        final note = (h['note'] as String?)?.trim();
+        if (type == 'note') {
+          _standaloneNotes[id] = {'note': note ?? ''};
+          continue;
+        }
         final boundsData = h['bounds_data'] as List?;
         final cfi = (boundsData != null && boundsData.isNotEmpty)
             ? (boundsData.first['text'] as String? ?? '')
             : '';
-        final text = (h['highlighted_text'] as String?) ?? '';
-        final color = (h['color'] as String?) ?? 'yellow';
-
-        if (type == 'note') {
-          _standaloneNotes[id] = {
-            'note': h['note'] as String? ?? '',
-          };
-        } else if (type == 'underline' && cfi.isNotEmpty) {
-          _underlines[id] = {'cfi': cfi, 'text': text};
-          _epubController.addUnderline(cfi: cfi);
-        } else if (cfi.isNotEmpty) {
-          _highlights[id] = {'cfi': cfi, 'text': text, 'color': color};
-          _epubController.addHighlight(cfi: cfi, color: _colorFromName(color));
+        if (!cfi.startsWith('epubcfi(')) continue;
+        final kind = type == 'underline' ? 'underline' : 'highlight';
+        final key = EpubAnnotation.keyFor(kind, cfi);
+        final existing = _annotations[key];
+        if (existing != null) {
+          // Older versions could save the same annotation twice.
+          existing.serverIds.add(id);
+          if ((existing.note ?? '').isEmpty && (note ?? '').isNotEmpty) {
+            existing.note = note;
+          }
+          continue;
         }
+        final color = (h['color'] as String?) ?? 'yellow';
+        final a = EpubAnnotation(
+          cfi: cfi,
+          type: kind,
+          color: epubHighlightColors.containsKey(color) ? color : 'yellow',
+          text: (h['highlighted_text'] as String?) ?? '',
+          note: (note ?? '').isEmpty ? null : note,
+        )..serverIds.add(id);
+        _annotations[key] = a;
+        _drawAnnotation(a);
       }
-    } catch (_) {}
+      setState(() {});
+    } catch (e) {
+      debugPrint('[EPUB] highlights unavailable: $e');
+    }
 
     try {
       final bookmarks = await _bookmarkService.getBookmarks(widget.documentId!);
@@ -620,19 +692,6 @@ class _EpubViewerScreenState extends State<EpubViewerScreen>
       _updateBookmarkState();
       if (mounted) setState(() {});
     } catch (_) {}
-  }
-
-  Color _colorFromName(String name) {
-    switch (name) {
-      case 'green':
-        return Colors.green;
-      case 'blue':
-        return Colors.blue;
-      case 'pink':
-        return Colors.pink;
-      default:
-        return Colors.yellow;
-    }
   }
 
   // ── Bookmarks ─────────────────────────────────────────────────────
@@ -704,116 +763,328 @@ class _EpubViewerScreenState extends State<EpubViewerScreen>
     }
   }
 
-  // ── Highlight / Underline ─────────────────────────────────────────
+  // ── Highlights, underlines and notes ─────────────────────────────
 
-  void _highlightSelected(String color) {
-    if (_selectedCfi == null || _selectedCfi!.isEmpty) {
-      showAppDialog(context,
-          message: 'Select text first by long-pressing on it',
-          type: AppDialogType.info);
-      return;
-    }
+  void _drawAnnotation(EpubAnnotation a) {
+    unawaited(EpubReaderBridge.addAnnotation(_epubController,
+        cfi: a.cfi, type: a.type, color: a.color));
+  }
 
-    final cfi = _selectedCfi!;
-    final text = _selectedText ?? '';
+  void _showSnack(String message, {SnackBarAction? action}) {
+    if (!mounted) return;
+    final messenger = ScaffoldMessenger.of(context);
+    messenger.hideCurrentSnackBar();
+    messenger.showSnackBar(SnackBar(
+      content: Text(message),
+      action: action,
+      behavior: SnackBarBehavior.floating,
+      duration: const Duration(seconds: 4),
+    ));
+  }
 
-    _epubController.addHighlight(cfi: cfi, color: _colorFromName(color));
-    _epubController.clearSelection();
+  /// Runs backend work for [a] after any earlier work for it, so a quick
+  /// colour change, note or removal never races the first save.
+  void _sync(EpubAnnotation a, Future<void> Function() work) {
+    a.saving = (a.saving ?? Future<void>.value())
+        .then((_) => work())
+        .catchError((Object e) => debugPrint('[EPUB] annotation sync: $e'));
+  }
 
-    if (widget.documentId != null) {
-      _highlightService.addHighlight(
-        documentId: widget.documentId!,
+  Future<void> _postAnnotation(EpubAnnotation a) async {
+    final documentId = widget.documentId;
+    if (documentId == null || a.removed) return;
+    try {
+      final text = a.text.length > 2000 ? a.text.substring(0, 2000) : a.text;
+      final result = await _highlightService.addHighlight(
+        documentId: documentId,
         pageNumber: 1,
         startOffset: 0,
         endOffset: 0,
-        highlightedText: text.length > 2000 ? text.substring(0, 2000) : text,
-        color: color,
-        annotationType: 'highlight',
+        highlightedText: text,
+        color: a.isHighlight ? a.color : 'blue',
+        note: a.note,
+        annotationType: a.type,
         boundsData: [
           {
             'left': 0,
             'top': 0,
             'width': 0,
             'height': 0,
-            'text': cfi,
+            'text': a.cfi,
             'page_number': 1
           }
         ],
-      ).then((result) {
-        final id = result['highlight_id'] as String;
-        setState(() {
-          _highlights[id] = {'cfi': cfi, 'text': text, 'color': color};
-          _lastActionId = id;
-        });
-      }).catchError((_) {});
+      );
+      final id = result['highlight_id'] as String?;
+      if (id == null) return;
+      if (a.removed) {
+        await _deleteServerIds([id]);
+      } else {
+        a.serverIds.add(id);
+      }
+    } catch (e) {
+      debugPrint('[EPUB] annotation not saved: $e');
+      if (!a.removed) {
+        _showSnack(a.isHighlight
+            ? 'Highlight not saved. Check your connection.'
+            : 'Underline not saved. Check your connection.');
+      }
     }
-
-    _selectedCfi = null;
-    _selectedText = null;
   }
 
-  void _underlineSelected() {
-    if (_selectedCfi == null || _selectedCfi!.isEmpty) {
+  Future<void> _deleteServerIds(List<String> ids) async {
+    for (final id in ids) {
+      try {
+        await _highlightService.deleteHighlight(id);
+      } catch (e) {
+        debugPrint('[EPUB] annotation $id not deleted: $e');
+      }
+    }
+  }
+
+  List<String> _takeServerIds(EpubAnnotation a) {
+    final ids = List<String>.of(a.serverIds);
+    a.serverIds.clear();
+    return ids;
+  }
+
+  /// Highlight or underline the current selection (selection menu or the
+  /// bottom bar). Re-highlighting a highlight changes its colour.
+  EpubAnnotation? _annotateSelection(
+      {required String type, String color = 'yellow'}) {
+    final cfi = _selectedCfi;
+    final text = _selectedText ?? '';
+    if (cfi == null || cfi.isEmpty) {
       showAppDialog(context,
           message: 'Select text first by long-pressing on it',
           type: AppDialogType.info);
-      return;
+      return null;
     }
-
-    final cfi = _selectedCfi!;
-    final text = _selectedText ?? '';
-
-    _epubController.addUnderline(cfi: cfi);
-    _epubController.clearSelection();
-
-    if (widget.documentId != null) {
-      _highlightService.addHighlight(
-        documentId: widget.documentId!,
-        pageNumber: 1,
-        startOffset: 0,
-        endOffset: 0,
-        highlightedText: text.length > 2000 ? text.substring(0, 2000) : text,
-        color: 'blue',
-        annotationType: 'underline',
-        boundsData: [
-          {
-            'left': 0,
-            'top': 0,
-            'width': 0,
-            'height': 0,
-            'text': cfi,
-            'page_number': 1
-          }
-        ],
-      ).then((result) {
-        final id = result['highlight_id'] as String;
-        setState(() {
-          _underlines[id] = {'cfi': cfi, 'text': text};
-          _lastActionId = id;
-        });
-      }).catchError((_) {});
-    }
-
-    _selectedCfi = null;
-    _selectedText = null;
+    _clearSelection();
+    return _addAnnotation(cfi: cfi, type: type, color: color, text: text);
   }
 
-  void _removeAnnotation(String id) {
-    if (_highlights.containsKey(id)) {
-      _epubController.removeHighlight(cfi: _highlights[id]!['cfi']!);
-      _highlights.remove(id);
-    } else if (_underlines.containsKey(id)) {
-      _epubController.removeUnderline(cfi: _underlines[id]!['cfi']!);
-      _underlines.remove(id);
+  EpubAnnotation _addAnnotation({
+    required String cfi,
+    required String type,
+    String color = 'yellow',
+    String text = '',
+    String? note,
+  }) {
+    final key = EpubAnnotation.keyFor(type, cfi);
+    final existing = _annotations[key];
+    if (existing != null) {
+      if (existing.isHighlight) _setHighlightColor(existing, color);
+      setState(() => _lastActionId = key);
+      return existing;
     }
-    _standaloneNotes.remove(id);
+    final a = EpubAnnotation(
+        cfi: cfi, type: type, color: color, text: text, note: note);
+    setState(() {
+      _annotations[key] = a;
+      _lastActionId = key;
+    });
+    _drawAnnotation(a);
+    _sync(a, () => _postAnnotation(a));
+    return a;
+  }
+
+  void _setHighlightColor(EpubAnnotation a, String color) {
+    if (a.color == color) return;
+    setState(() => a.color = color);
+    _drawAnnotation(a);
+    // The backend has no colour update: save the new colour, then delete
+    // the old row(s).
+    _sync(a, () async {
+      final stale = _takeServerIds(a);
+      await _postAnnotation(a);
+      await _deleteServerIds(stale);
+    });
+  }
+
+  void _removeAnnotations(List<EpubAnnotation> list, {bool offerUndo = true}) {
+    if (list.isEmpty) return;
+    setState(() {
+      for (final a in list) {
+        a.removed = true;
+        _annotations.remove(a.key);
+        if (_lastActionId == a.key) _lastActionId = null;
+      }
+      _menu = null;
+    });
+    for (final a in list) {
+      unawaited(EpubReaderBridge.removeAnnotation(_epubController,
+          cfi: a.cfi, type: a.type));
+      _sync(a, () => _deleteServerIds(_takeServerIds(a)));
+    }
+    if (!offerUndo) return;
+    final single = list.length == 1;
+    _showSnack(
+      single
+          ? (list.first.isHighlight ? 'Highlight removed' : 'Underline removed')
+          : 'Highlight and underline removed',
+      action: SnackBarAction(
+        label: 'Undo',
+        onPressed: () {
+          if (!mounted) return;
+          for (final a in list) {
+            _addAnnotation(
+                cfi: a.cfi,
+                type: a.type,
+                color: a.color,
+                text: a.text,
+                note: a.note);
+          }
+        },
+      ),
+    );
+  }
+
+  void _clearSelection() {
+    _selectedCfi = null;
+    _selectedText = null;
+    _hasSelection = false;
+    if (mounted && _menu != null) setState(() => _menu = null);
+    unawaited(EpubReaderBridge.resetSelection(_epubController));
+  }
+
+  /// A tap normally clears the selection in the book itself; if the book
+  /// does not report that, check it so the reader never stays blocked.
+  void _verifySelectionSoon() {
+    _selectionCheckTimer?.cancel();
+    _selectionCheckTimer = Timer(const Duration(milliseconds: 450), () async {
+      if (!mounted || !_hasSelection) return;
+      final still = await EpubReaderBridge.hasSelection(_epubController);
+      if (!mounted || still) return;
+      _clearSelection();
+    });
+  }
+
+  void _showAnnotationMenu(EpubTapTarget target) {
+    final keys = [
+      for (final hit in target.annotations)
+        if (_annotations.containsKey(EpubAnnotation.keyFor(hit.type, hit.cfi)))
+          EpubAnnotation.keyFor(hit.type, hit.cfi)
+    ];
+    final box = _bookKey.currentContext?.findRenderObject() as RenderBox?;
+    final r = target.rect;
+    if (keys.isEmpty || box == null || r == null) {
+      setState(() => _chromeVisible = !_chromeVisible);
+      return;
+    }
+    final size = box.size;
+    setState(() => _menu = _ReaderMenu(
+        Rect.fromLTWH(r.left * size.width, r.top * size.height,
+            r.width * size.width, r.height * size.height),
+        keys));
+  }
+
+  Widget _buildMenu(_ReaderMenu menu, Size area, bool isDark) {
+    if (menu.forSelection) {
+      return EpubAnnotationMenu(
+        anchor: menu.rect,
+        area: area,
+        dark: isDark,
+        accentColor: _readerAccent,
+        onColor: (color) => _annotateSelection(type: 'highlight', color: color),
+        onUnderline: () => _annotateSelection(type: 'underline'),
+        onNote: () {
+          final a = _annotateSelection(type: 'highlight');
+          if (a != null) _editNote(a);
+        },
+      );
+    }
+    final items = [
+      for (final key in menu.keys)
+        if (_annotations[key] != null) _annotations[key]!
+    ];
+    if (items.isEmpty) return const SizedBox.shrink();
+    final highlight = items.where((a) => a.isHighlight).firstOrNull;
+    final underline = items.where((a) => !a.isHighlight).firstOrNull;
+    final primary = highlight ?? underline!;
+    return EpubAnnotationMenu(
+      anchor: menu.rect,
+      area: area,
+      dark: isDark,
+      accentColor: _readerAccent,
+      selectedColor: highlight?.color,
+      underlined: underline != null,
+      hasNote: (primary.note ?? '').isNotEmpty,
+      onColor: (color) {
+        setState(() => _menu = null);
+        if (highlight != null) {
+          _setHighlightColor(highlight, color);
+        } else {
+          _addAnnotation(
+              cfi: primary.cfi,
+              type: 'highlight',
+              color: color,
+              text: primary.text);
+        }
+      },
+      onUnderline: () {
+        setState(() => _menu = null);
+        if (underline != null) {
+          _removeAnnotations([underline]);
+        } else {
+          _addAnnotation(
+              cfi: primary.cfi, type: 'underline', text: primary.text);
+        }
+      },
+      onNote: () {
+        setState(() => _menu = null);
+        _editNote(primary);
+      },
+      onRemove: () => _removeAnnotations(items),
+    );
+  }
+
+  void _editNote(EpubAnnotation a) {
+    _showNoteEditor(
+      title: (a.note ?? '').isEmpty ? 'Add Note' : 'Edit Note',
+      quote: a.text,
+      initial: a.note ?? '',
+      allowEmpty: true,
+      onSave: (text) {
+        final note = text.trim().isEmpty ? null : text.trim();
+        if (note == a.note) return;
+        setState(() => a.note = note);
+        _sync(a, () async {
+          if (a.removed) return;
+          if (a.serverIds.isEmpty) {
+            // Not saved yet (or the first save failed): save it with the note.
+            await _postAnnotation(a);
+            return;
+          }
+          try {
+            await _highlightService.updateHighlightNote(
+                a.serverIds.first, note);
+          } catch (e) {
+            debugPrint('[EPUB] note not saved: $e');
+            _showSnack('Note not saved. Check your connection.');
+          }
+        });
+      },
+    );
+  }
+
+  void _deleteStandaloneNote(String id) {
+    setState(() {
+      _standaloneNotes.remove(id);
+      if (_lastActionId == id) _lastActionId = null;
+    });
     _highlightService.deleteHighlight(id).catchError((_) {});
-    setState(() {});
   }
 
   void _undoLast(StateSetter setSheetState) {
-    if (_lastActionId == null) return;
-    _removeAnnotation(_lastActionId!);
+    final id = _lastActionId;
+    if (id == null) return;
+    final a = _annotations[id];
+    if (a != null) {
+      _removeAnnotations([a], offerUndo: false);
+    } else if (_standaloneNotes.containsKey(id)) {
+      _deleteStandaloneNote(id);
+    }
     _lastActionId = null;
     setSheetState(() {});
   }
@@ -821,6 +1092,7 @@ class _EpubViewerScreenState extends State<EpubViewerScreen>
   // ── Notes panel ───────────────────────────────────────────────────
 
   void _showNotesPanel() {
+    _clearSelection();
     final isDark =
         Provider.of<ThemeProvider>(context, listen: false).isDarkMode;
     final isTablet = ResponsiveHelper.isTablet(context);
@@ -837,11 +1109,9 @@ class _EpubViewerScreenState extends State<EpubViewerScreen>
           borderRadius: BorderRadius.vertical(top: Radius.circular(20))),
       builder: (sheetContext) {
         return StatefulBuilder(builder: (sheetContext, setSheetState) {
-          final allIds = [
-            ..._highlights.keys,
-            ..._underlines.keys,
-            ..._standaloneNotes.keys
-          ];
+          final annotations = _annotations.values.toList();
+          final noteIds = _standaloneNotes.keys.toList();
+          final count = annotations.length + noteIds.length;
           return DraggableScrollableSheet(
             initialChildSize: 0.5,
             minChildSize: 0.3,
@@ -888,7 +1158,7 @@ class _EpubViewerScreenState extends State<EpubViewerScreen>
                         : const Color(0xFFF0F0F0)),
                 // List
                 Expanded(
-                  child: allIds.isEmpty
+                  child: count == 0
                       ? Center(
                           child:
                               Column(mainAxisSize: MainAxisSize.min, children: [
@@ -902,7 +1172,7 @@ class _EpubViewerScreenState extends State<EpubViewerScreen>
                       : ListView.separated(
                           controller: scrollController,
                           padding: const EdgeInsets.symmetric(vertical: 8),
-                          itemCount: allIds.length,
+                          itemCount: count,
                           separatorBuilder: (_, __) => Divider(
                               height: 1,
                               indent: 60,
@@ -911,43 +1181,21 @@ class _EpubViewerScreenState extends State<EpubViewerScreen>
                                   ? AppColors.darkDivider
                                   : const Color(0xFFF0F0F0)),
                           itemBuilder: (_, index) {
-                            final id = allIds[index];
-
-                            // Standalone note
-                            if (_standaloneNotes.containsKey(id)) {
+                            if (index >= annotations.length) {
+                              final id = noteIds[index - annotations.length];
                               return _buildNoteItem(
                                   id,
-                                  _standaloneNotes[id]!['note'] as String,
+                                  _standaloneNotes[id]?['note'] as String? ??
+                                      '',
                                   textColor,
-                                  setSheetState,
-                                  sheetContext);
+                                  setSheetState);
                             }
-
-                            // Highlight
-                            if (_highlights.containsKey(id)) {
-                              final h = _highlights[id]!;
-                              return _buildAnnotationItem(
-                                  id: id,
-                                  text: h['text'] ?? '',
-                                  isHighlight: true,
-                                  color: _colorFromName(h['color'] ?? 'yellow'),
-                                  cfi: h['cfi'] ?? '',
-                                  textColor: textColor,
-                                  setSheetState: setSheetState,
-                                  sheetContext: sheetContext);
-                            }
-
-                            // Underline
-                            final u = _underlines[id]!;
                             return _buildAnnotationItem(
-                                id: id,
-                                text: u['text'] ?? '',
-                                isHighlight: false,
-                                color: Colors.blue,
-                                cfi: u['cfi'] ?? '',
-                                textColor: textColor,
-                                setSheetState: setSheetState,
-                                sheetContext: sheetContext);
+                                annotations[index],
+                                textColor,
+                                subtitleColor,
+                                setSheetState,
+                                sheetContext);
                           },
                         ),
                 ),
@@ -980,7 +1228,7 @@ class _EpubViewerScreenState extends State<EpubViewerScreen>
   }
 
   Widget _buildNoteItem(String id, String noteText, Color textColor,
-      StateSetter setSheetState, BuildContext sheetContext) {
+      StateSetter setSheetState) {
     return InkWell(
       child: Padding(
         padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 12),
@@ -998,7 +1246,7 @@ class _EpubViewerScreenState extends State<EpubViewerScreen>
                       TextStyle(fontSize: 13, color: textColor, height: 1.3))),
           GestureDetector(
               onTap: () {
-                _removeAnnotation(id);
+                _deleteStandaloneNote(id);
                 setSheetState(() {});
               },
               child: Padding(
@@ -1011,60 +1259,63 @@ class _EpubViewerScreenState extends State<EpubViewerScreen>
     );
   }
 
-  Widget _buildAnnotationItem({
-    required String id,
-    required String text,
-    required bool isHighlight,
-    required Color color,
-    required String cfi,
-    required Color textColor,
-    required StateSetter setSheetState,
-    required BuildContext sheetContext,
-  }) {
+  Widget _buildAnnotationItem(
+      EpubAnnotation a,
+      Color textColor,
+      Color subtitleColor,
+      StateSetter setSheetState,
+      BuildContext sheetContext) {
+    final color = a.isHighlight
+        ? epubHighlightColors[a.color] ?? epubHighlightColors['yellow']!
+        : (_isDarkMode ? const Color(0xFF8ABFFF) : const Color(0xFF1565C0));
+    void goTo() {
+      Navigator.pop(sheetContext);
+      _displayCfi(a.cfi);
+    }
+
     return InkWell(
-      onTap: () {
-        if (cfi.isNotEmpty) {
-          _epubController.display(cfi: cfi);
-          Navigator.pop(sheetContext);
-        }
-      },
+      onTap: goTo,
       child: Padding(
         padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 12),
         child: Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
           CircleAvatar(
               radius: 15,
-              backgroundColor: color.withValues(alpha: 0.15),
+              backgroundColor: color.withValues(alpha: 0.22),
               child: Icon(
-                  isHighlight ? Icons.border_color : Icons.format_underlined,
+                  a.isHighlight ? Icons.border_color : Icons.format_underlined,
                   size: 16,
-                  color: color)),
+                  color: a.isHighlight ? textColor : color)),
           const SizedBox(width: 10),
           Expanded(
               child: Column(
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
-              if (text.isNotEmpty)
-                Text(text,
-                    maxLines: 2,
+              Text(
+                  a.text.trim().isNotEmpty
+                      ? a.text.trim()
+                      : (a.isHighlight ? 'Highlight' : 'Underline'),
+                  maxLines: 2,
+                  overflow: TextOverflow.ellipsis,
+                  style: TextStyle(
+                      fontSize: 13,
+                      color: textColor,
+                      fontStyle: a.text.trim().isNotEmpty
+                          ? FontStyle.italic
+                          : FontStyle.normal,
+                      height: 1.3)),
+              if ((a.note ?? '').isNotEmpty) ...[
+                const SizedBox(height: 4),
+                Text(a.note!,
+                    maxLines: 3,
                     overflow: TextOverflow.ellipsis,
                     style: TextStyle(
-                        fontSize: 13,
-                        color: textColor,
-                        fontStyle: FontStyle.italic,
-                        height: 1.3)),
-              if (text.isEmpty)
-                Text(isHighlight ? 'Highlight' : 'Underline',
-                    style: TextStyle(fontSize: 13, color: textColor)),
+                        fontSize: 12, color: subtitleColor, height: 1.3)),
+              ],
             ],
           )),
           // Navigate to location
           GestureDetector(
-              onTap: () {
-                if (cfi.isNotEmpty) {
-                  _epubController.display(cfi: cfi);
-                  Navigator.pop(sheetContext);
-                }
-              },
+              onTap: goTo,
               child: Padding(
                   padding: const EdgeInsets.only(left: 6),
                   child: Icon(Icons.my_location,
@@ -1072,7 +1323,7 @@ class _EpubViewerScreenState extends State<EpubViewerScreen>
           // Delete
           GestureDetector(
               onTap: () {
-                _removeAnnotation(id);
+                _removeAnnotations([a]);
                 setSheetState(() {});
               },
               child: Padding(
@@ -1086,11 +1337,25 @@ class _EpubViewerScreenState extends State<EpubViewerScreen>
   }
 
   void _showAddNoteDialog(StateSetter setSheetState) {
+    _showNoteEditor(
+      title: 'Add Note',
+      onSave: (note) => _saveStandaloneNote(note, setSheetState),
+    );
+  }
+
+  /// Note editor sheet, shared by standalone notes and notes on highlights.
+  void _showNoteEditor({
+    required String title,
+    required ValueChanged<String> onSave,
+    String initial = '',
+    String quote = '',
+    bool allowEmpty = false,
+  }) {
     final isDark =
         Provider.of<ThemeProvider>(context, listen: false).isDarkMode;
     final bgColor = isDark ? AppColors.darkCardBackground : Colors.white;
     final textColor = isDark ? AppColors.darkTextPrimary : Colors.black;
-    final noteCtrl = TextEditingController();
+    final noteCtrl = TextEditingController(text: initial);
 
     showModalBottomSheet(
       context: context,
@@ -1115,12 +1380,31 @@ class _EpubViewerScreenState extends State<EpubViewerScreen>
                         borderRadius: BorderRadius.circular(2)))),
             Padding(
                 padding: const EdgeInsets.symmetric(horizontal: 20),
-                child: Text('Add Note',
+                child: Text(title,
                     style: TextStyle(
                         fontFamily: 'SF Pro Display',
                         fontWeight: FontWeight.w700,
                         fontSize: 18,
                         color: textColor))),
+            if (quote.trim().isNotEmpty)
+              Padding(
+                padding: const EdgeInsets.fromLTRB(20, 10, 20, 0),
+                child: Container(
+                  padding: const EdgeInsets.only(left: 10),
+                  decoration: BoxDecoration(
+                      border: Border(
+                          left: BorderSide(color: _readerAccent, width: 3))),
+                  child: Text(quote.trim(),
+                      maxLines: 3,
+                      overflow: TextOverflow.ellipsis,
+                      style: TextStyle(
+                          fontSize: 13,
+                          fontStyle: FontStyle.italic,
+                          color: isDark
+                              ? AppColors.darkTextSecondary
+                              : Colors.grey[700])),
+                ),
+              ),
             const SizedBox(height: 12),
             Padding(
                 padding: const EdgeInsets.symmetric(horizontal: 20),
@@ -1171,9 +1455,9 @@ class _EpubViewerScreenState extends State<EpubViewerScreen>
                               borderRadius: BorderRadius.circular(24),
                               onTap: () {
                                 final note = noteCtrl.text.trim();
-                                if (note.isEmpty) return;
+                                if (note.isEmpty && !allowEmpty) return;
                                 Navigator.pop(ctx);
-                                _saveStandaloneNote(note, setSheetState);
+                                onSave(note);
                               },
                               child: const Padding(
                                   padding: EdgeInsets.symmetric(
@@ -1188,7 +1472,11 @@ class _EpubViewerScreenState extends State<EpubViewerScreen>
           ],
         )),
       ),
-    );
+    ).whenComplete(() {
+      // Disposed after the sheet's closing animation.
+      Future<void>.delayed(
+          const Duration(milliseconds: 400), noteCtrl.dispose);
+    });
   }
 
   Future<void> _saveStandaloneNote(
@@ -1206,6 +1494,7 @@ class _EpubViewerScreenState extends State<EpubViewerScreen>
         note: note,
       );
       final id = result['highlight_id'] as String;
+      if (!mounted) return;
       setState(() {
         _standaloneNotes[id] = {'note': note};
         _lastActionId = id;
@@ -1216,73 +1505,6 @@ class _EpubViewerScreenState extends State<EpubViewerScreen>
         showAppDialog(context,
             message: 'Failed to save note', type: AppDialogType.info);
     }
-  }
-
-  // ── Annotation tap handler ────────────────────────────────────────
-
-  void _onAnnotationClicked(String cfi) {
-    // Find which annotation was clicked
-    String? id;
-    bool isHighlight = true;
-    for (final entry in _highlights.entries) {
-      if (entry.value['cfi'] == cfi) {
-        id = entry.key;
-        break;
-      }
-    }
-    if (id == null) {
-      for (final entry in _underlines.entries) {
-        if (entry.value['cfi'] == cfi) {
-          id = entry.key;
-          isHighlight = false;
-          break;
-        }
-      }
-    }
-    if (id == null) return;
-
-    final isDark =
-        Provider.of<ThemeProvider>(context, listen: false).isDarkMode;
-    final bgColor = isDark ? AppColors.darkCardBackground : Colors.white;
-
-    showModalBottomSheet(
-      context: context,
-      backgroundColor: bgColor,
-      shape: const RoundedRectangleBorder(
-          borderRadius: BorderRadius.vertical(top: Radius.circular(16))),
-      builder: (ctx) => SafeArea(
-          child: Column(
-        mainAxisSize: MainAxisSize.min,
-        children: [
-          Container(
-              width: 32,
-              height: 4,
-              margin: const EdgeInsets.only(top: 10, bottom: 16),
-              decoration: BoxDecoration(
-                  color: isDark ? Colors.white24 : Colors.black12,
-                  borderRadius: BorderRadius.circular(2))),
-          InkWell(
-              onTap: () {
-                Navigator.pop(ctx);
-                _removeAnnotation(id!);
-              },
-              child: Padding(
-                  padding:
-                      const EdgeInsets.symmetric(horizontal: 20, vertical: 14),
-                  child: Row(children: [
-                    const Icon(Icons.delete_outline,
-                        size: 20, color: AppColors.error),
-                    const SizedBox(width: 12),
-                    Text(isHighlight ? 'Remove Highlight' : 'Remove Underline',
-                        style: const TextStyle(
-                            fontSize: 15,
-                            fontWeight: FontWeight.w500,
-                            color: AppColors.error)),
-                  ]))),
-          const SizedBox(height: 8),
-        ],
-      )),
-    );
   }
 
   // ── Build ─────────────────────────────────────────────────────────
@@ -1297,11 +1519,10 @@ class _EpubViewerScreenState extends State<EpubViewerScreen>
     final toolbarColor = isDark ? AppColors.darkCardBackground : Colors.white;
 
     return PopScope(
-      canPop: !_imageFocused,
+      // Back first dismisses the selection/annotation menu.
+      canPop: _menu == null,
       onPopInvokedWithResult: (didPop, _) {
-        if (!didPop && _imageFocused) {
-          unawaited(closeEpubFocusedImage(_epubController));
-        }
+        if (!didPop && _menu != null) _clearSelection();
       },
       child: Scaffold(
         // A location/search keyboard must not resize epub.js mid-navigation.
@@ -1413,6 +1634,14 @@ class _EpubViewerScreenState extends State<EpubViewerScreen>
 
   // ── Page navigation + go-to-location ──────────────────────────────
 
+  /// Navigation inside the book. The book refuses to move while text is
+  /// selected, so the selection is cleared first.
+  void _displayCfi(String cfi) {
+    if (cfi.isEmpty) return;
+    if (_hasSelection || _menu != null) _clearSelection();
+    _epubController.display(cfi: cfi);
+  }
+
   void _onBookTouchDown(double x, double y) {
     _touchDown = Offset(x, y);
     _touchDownAt = DateTime.now();
@@ -1424,94 +1653,270 @@ class _EpubViewerScreenState extends State<EpubViewerScreen>
     final at = _touchDownAt;
     _touchDown = null;
     _touchDownAt = null;
-    // While text is selected, taps and drags belong to the selection UI.
     if (down == null || at == null || !_isEpubReady || _imageFocused) return;
-    if (_touchDownHadSelection || _hasSelection) return;
+    final hadSelection = _touchDownHadSelection || _hasSelection;
 
     final dx = x - down.dx;
     final dy = y - down.dy;
     final heldMs = DateTime.now().difference(at).inMilliseconds;
 
-    // A quick, stationary touch is a tap: show/hide the reader chrome. (A long
-    // press starts a text selection and must not toggle anything.)
+    // A quick, stationary touch is a tap. (A long press starts a text
+    // selection and must not toggle anything.)
     if (dx.abs() < 0.03 && dy.abs() < 0.03 && heldMs < 350) {
-      // The chapter's image click arrives just after touch-up. Give it a
-      // moment to open the focus viewer before changing the book's layout.
-      _chromeTapTimer?.cancel();
-      _chromeTapTimer = Timer(const Duration(milliseconds: 100), () async {
-        if (!mounted || _imageFocused) return;
-        try {
-          final opened = await _epubController.webViewController
-              ?.evaluateJavascript(source:
-                  'window.pgmeOpenImageAt && window.pgmeOpenImageAt($x, $y)')
-              .timeout(const Duration(milliseconds: 500),
-                  onTimeout: () => false);
-          if (opened == true) return;
-        } catch (e) {
-          debugPrint('[EPUB] image tap unavailable: $e');
-        }
-        if (mounted && !_imageFocused) {
-          setState(() => _chromeVisible = !_chromeVisible);
-        }
-      });
+      if (_menu != null && !_menu!.forSelection) {
+        setState(() => _menu = null);
+        return;
+      }
+      // The book clears its own selection on a tap.
+      if (hadSelection) {
+        _verifySelectionSoon();
+        return;
+      }
+      unawaited(_handleTap(x, y));
       return;
     }
 
-    // iOS only: swipe left/right turns the page in paginated mode. Android's
-    // built-in swipe handler (enabled by the package on Android) already does
-    // this, so doing it here too would turn two pages at once there.
+    // While text is selected, drags belong to the selection handles.
+    if (hadSelection) return;
+
+    // iOS only: swipe left/right turns the page in paginated mode. On
+    // Android the book page detects swipes itself and asks for the turn
+    // (EpubReaderBridge), so doing it here too would turn two pages.
     if (Platform.isIOS &&
         !_isScrollMode &&
-        dx.abs() >= 0.2 &&
+        dx.abs() >= 0.12 &&
         dx.abs() > dy.abs() * 1.5) {
-      _turnPage(forward: dx < 0);
+      unawaited(_turnPage(forward: dx < 0));
     }
   }
 
-  /// Turn through epub.js. A WebView screenshot was used by the old curl
-  /// effect and could stall the reader on a device. The optional fast fade is
-  /// a Flutter overlay and never blocks the book on a capture operation.
-  Future<void> _turnPage({required bool forward}) async {
-    if (!_isEpubReady || _isScrollMode || _hasSelection || _imageFocused)
+  /// Tap on the book: open an image, show the menu for a highlight, follow
+  /// a link (the book does that), or show/hide the reader controls.
+  Future<void> _handleTap(double x, double y) async {
+    final generation = _viewerGeneration;
+    final target = await EpubReaderBridge.tapAt(_epubController, x, y);
+    if (!mounted ||
+        generation != _viewerGeneration ||
+        _imageFocused ||
+        _hasSelection ||
+        _turning) {
       return;
+    }
+    switch (target.kind) {
+      case 'image':
+        await _openImage(target);
+      case 'annotation':
+        _showAnnotationMenu(target);
+      case 'link':
+        break;
+      default:
+        setState(() {
+          _menu = null;
+          _chromeVisible = !_chromeVisible;
+        });
+    }
+  }
+
+  Future<void> _openImage(EpubTapTarget target) async {
+    final src = target.src;
+    if (src == null) return;
+    _imageFocused = true;
+    try {
+      final bytes = await EpubReaderBridge.imageBytes(_epubController, src);
+      if (!mounted) return;
+      if (bytes == null) {
+        _showSnack('This image could not be opened.');
+        return;
+      }
+      final screen = MediaQuery.sizeOf(context);
+      var origin = Rect.fromCenter(
+          center: screen.center(Offset.zero), width: 48, height: 48);
+      final box = _bookKey.currentContext?.findRenderObject() as RenderBox?;
+      final r = target.rect;
+      if (box != null && box.attached && r != null) {
+        final size = box.size;
+        final o = box.localToGlobal(Offset.zero);
+        origin = Rect.fromLTWH(o.dx + r.left * size.width,
+            o.dy + r.top * size.height, r.width * size.width,
+            r.height * size.height);
+      }
+      await showEpubImageFocus(context,
+          bytes: bytes, origin: origin, label: target.label);
+    } finally {
+      _imageFocused = false;
+    }
+  }
+
+  /// Turns the page with the chosen effect (Slide, Curl or Fast Fade).
+  ///
+  /// The book is a web view that Flutter cannot move or bend, so a turn is
+  /// drawn with stills of the page laid over it: for "next" the real page
+  /// turns underneath and the still of the old page moves away; for
+  /// "previous" a still of the previous page moves back in over a still of
+  /// the current one. Every wait is bounded, and without a usable still the
+  /// page simply turns, so a turn can never leave the reader stuck.
+  Future<void> _turnPage({required bool forward}) async {
+    if (!_isEpubReady || _isScrollMode || _imageFocused) return;
+    if (_hasSelection || _menu != null) _clearSelection();
     if (_turning) {
-      _queuedTurnForward = forward;
+      _queuedTurnForward = forward; // played once this turn finishes
+      return;
+    }
+    if (forward ? _atEnd : _atStart) {
+      unawaited(HapticFeedback.selectionClick());
       return;
     }
     _turning = true;
-    final fade = _pageTurn == EpubPageTurn.fastFade &&
-        !(MediaQuery.maybeOf(context)?.disableAnimations ?? false);
+    final generation = _viewerGeneration;
+    final startCfi = _currentCfi;
+    final style = _pageTurn == EpubPageTurn.curl && _curlProgram == null
+        ? EpubPageTurn.slide
+        : _pageTurn;
+    final animate =
+        !(MediaQuery.maybeOf(context)?.disableAnimations ?? false) &&
+            !_snapshotsUnavailable;
     try {
-      if (fade) await _pageFade.forward(from: 0).orCancel;
-      if (!mounted) return;
-      final relocated = _turnRelocated = Completer<String?>();
-      if (forward) {
-        _epubController.next();
-      } else {
-        _epubController.prev();
+      final current = animate ? await _snapshotBook() : null;
+      if (!mounted || generation != _viewerGeneration) {
+        current?.dispose();
+        return;
       }
-      // At the first/last page there is no relocation. Do not leave the page
-      // covered or stop accepting input while waiting for one.
-      await relocated.future
-          .timeout(const Duration(milliseconds: 500), onTimeout: () => null);
-      if (fade && mounted) {
-        await Future<void>.delayed(const Duration(milliseconds: 35));
-        if (mounted) await _pageFade.reverse(from: 1).orCancel;
+      if (current != null) {
+        // Cover the book with the still before it changes underneath.
+        setState(() => _turnCover = current);
+        await _nextFrames();
+        if (!mounted) return;
+      }
+      final relocated = _turnRelocated = Completer<String?>();
+      await EpubReaderBridge.turn(_epubController, forward);
+      final newCfi = await relocated.future
+          .timeout(const Duration(milliseconds: 900), onTimeout: () => null);
+      // First/last page or a failed turn: nothing to animate.
+      if (current == null ||
+          !mounted ||
+          generation != _viewerGeneration ||
+          newCfi == null ||
+          newCfi == startCfi) {
+        return;
+      }
+      _turnAnim.duration = switch (style) {
+        EpubPageTurn.curl => const Duration(milliseconds: 460),
+        EpubPageTurn.slide => const Duration(milliseconds: 280),
+        EpubPageTurn.fastFade => const Duration(milliseconds: 170),
+      };
+      if (forward) {
+        // Give the web view a moment to paint the new page underneath.
+        await Future<void>.delayed(const Duration(milliseconds: 50));
+        if (!mounted) return;
+        setState(() {
+          _turnStyle = style;
+          _turnAnim.value = 0;
+          _turnImage = current;
+          _turnCover = null;
+        });
+        await _turnAnim.forward(from: 0).orCancel;
+      } else {
+        final previous = await _snapshotBook();
+        if (!mounted || previous == null) {
+          previous?.dispose();
+          return;
+        }
+        setState(() {
+          _turnStyle = style;
+          _turnAnim.value = 1;
+          _turnImage = previous;
+        });
+        await _turnAnim.reverse(from: 1).orCancel;
       }
     } on TickerCanceled {
-      // The reader was closed during the fade.
+      // The reader closed during the turn.
     } catch (e) {
       debugPrint('[EPUB] page turn failed: $e');
     } finally {
       _turnRelocated = null;
       _turning = false;
+      final stills = <ui.Image>{
+        if (_turnCover != null) _turnCover!,
+        if (_turnImage != null) _turnImage!,
+      };
+      _turnCover = null;
+      _turnImage = null;
       if (mounted) {
-        _pageFade.value = 0;
+        setState(() {});
+        // Freed once a frame without them has been drawn.
+        WidgetsBinding.instance.addPostFrameCallback((_) {
+          for (final image in stills) {
+            image.dispose();
+          }
+        });
         final queued = _queuedTurnForward;
         _queuedTurnForward = null;
         if (queued != null) unawaited(_turnPage(forward: queued));
+      } else {
+        for (final image in stills) {
+          image.dispose();
+        }
       }
     }
+  }
+
+  Future<void> _nextFrames() async {
+    await WidgetsBinding.instance.endOfFrame;
+    if (!mounted) return;
+    WidgetsBinding.instance.scheduleFrame();
+    await WidgetsBinding.instance.endOfFrame;
+  }
+
+  /// A still of the book as it is on screen now, or null (bounded wait).
+  Future<ui.Image?> _snapshotBook() async {
+    final webView = _epubController.webViewController;
+    if (webView == null || _snapshotsUnavailable) return null;
+    try {
+      final bytes = await webView
+          .takeScreenshot(
+              // PNG keeps the web view's transparent margins transparent.
+              screenshotConfiguration:
+                  ScreenshotConfiguration(compressFormat: CompressFormat.PNG))
+          .timeout(const Duration(milliseconds: 700));
+      if (bytes == null || bytes.isEmpty) {
+        _snapshotFailures++;
+        return null;
+      }
+      final codec = await ui.instantiateImageCodec(bytes);
+      final image = (await codec.getNextFrame()).image;
+      codec.dispose();
+      if (!_snapshotsVerified) {
+        if (await _isBlankImage(image)) {
+          image.dispose();
+          _blankSnapshots++;
+          return null;
+        }
+        _snapshotsVerified = true;
+      }
+      _snapshotFailures = 0;
+      return image;
+    } on TimeoutException {
+      _snapshotFailures++;
+      debugPrint('[EPUB] page still timed out');
+      return null;
+    } catch (e) {
+      _snapshotFailures++;
+      debugPrint('[EPUB] page still failed: $e');
+      return null;
+    }
+  }
+
+  /// True when the still has a single colour (a capture-protected device
+  /// can return blank stills; animating those would hide the page).
+  Future<bool> _isBlankImage(ui.Image image) async {
+    final data = await image.toByteData(format: ui.ImageByteFormat.rawRgba);
+    if (data == null) return true;
+    final px = data.buffer.asUint8List();
+    final first = data.lengthInBytes >= 4 ? data.getUint32(0) : 0;
+    for (var i = 0; i + 3 < px.length; i += 4 * 397) {
+      if (data.getUint32(i) != first) return false;
+    }
+    return true;
   }
 
   Future<void> _showGoToLocationDialog() async {
@@ -1595,13 +2000,7 @@ class _EpubViewerScreenState extends State<EpubViewerScreen>
         child: Column(children: [
           Row(children: [
             GestureDetector(
-                onTap: () {
-                  if (_imageFocused) {
-                    unawaited(closeEpubFocusedImage(_epubController));
-                  } else {
-                    context.pop();
-                  }
-                },
+                onTap: () => context.pop(),
                 child: Container(
                     width: isTablet ? 44 : 36,
                     height: isTablet ? 44 : 36,
@@ -1732,8 +2131,7 @@ class _EpubViewerScreenState extends State<EpubViewerScreen>
                           await searchEpubBook(_epubController, value);
                       if (!mounted) return;
                       final cfi = await showEpubSearchResults(context, results);
-                      if (mounted && cfi != null)
-                        _epubController.display(cfi: cfi);
+                      if (mounted && cfi != null) _displayCfi(cfi);
                     } catch (e) {
                       if (mounted) {
                         showAppDialog(context,
@@ -1771,14 +2169,14 @@ class _EpubViewerScreenState extends State<EpubViewerScreen>
                 Icons.border_color,
                 'Highlight',
                 const Color(0xFFFFEB3B),
-                () => _highlightSelected('yellow'),
+                () => _annotateSelection(type: 'highlight'),
                 isDark,
                 isTablet),
             _bottomAction(
                 Icons.format_underlined,
                 'Underline',
                 isDark ? const Color(0xFF8ABFFF) : const Color(0xFF1565C0),
-                _underlineSelected,
+                () => _annotateSelection(type: 'underline'),
                 isDark,
                 isTablet),
             _bottomAction(
@@ -1850,16 +2248,8 @@ class _EpubViewerScreenState extends State<EpubViewerScreen>
 
   /// Puts the already-loaded highlights/underlines onto a freshly loaded book.
   void _reapplyAnnotations() {
-    for (final h in _highlights.values) {
-      final cfi = h['cfi'];
-      if (cfi != null && cfi.isNotEmpty) {
-        _epubController.addHighlight(
-            cfi: cfi, color: _colorFromName(h['color'] ?? 'yellow'));
-      }
-    }
-    for (final u in _underlines.values) {
-      final cfi = u['cfi'];
-      if (cfi != null && cfi.isNotEmpty) _epubController.addUnderline(cfi: cfi);
+    for (final a in _annotations.values) {
+      _drawAnnotation(a);
     }
   }
 
@@ -1868,10 +2258,11 @@ class _EpubViewerScreenState extends State<EpubViewerScreen>
         ? EpubSource.fromFile(File(_localPath!))
         : EpubSource.fromUrl(widget.epubUrl!);
     final generation = _viewerGeneration;
+    final pageColor = isDark ? AppColors.darkBackground : Colors.white;
 
     return LayoutBuilder(builder: (context, constraints) {
       _onBookViewSize(constraints.biggest);
-      return Stack(children: [
+      return Stack(key: _bookKey, children: [
         EpubViewer(
           key: ValueKey('epub-viewer-$_viewerGeneration'),
           epubSource: epubSource,
@@ -1895,17 +2286,12 @@ class _EpubViewerScreenState extends State<EpubViewerScreen>
               useSnapAnimationAndroid: false,
               theme: _currentReadingTheme(),
               allowScriptedContent: false),
-          selectionContextMenu: ContextMenu(
-              menuItems: [
-                ContextMenuItem(
-                    title: 'Highlight',
-                    id: 1,
-                    action: () => _highlightSelected('yellow')),
-                ContextMenuItem(
-                    title: 'Underline', id: 2, action: _underlineSelected),
-              ],
-              settings:
-                  ContextMenuSettings(hideDefaultSystemContextMenuItems: true)),
+          // The reader shows its own selection menu (EpubAnnotationMenu).
+          // flutter_inappwebview's native custom menu items are not used:
+          // on iOS they are kept on the web view class by memory address
+          // after the web view is gone, and a later web view at the same
+          // address runs the freed action (the Underline crash).
+          suppressNativeContextMenu: true,
           onChaptersLoaded: (chapters) {
             if (generation != _viewerGeneration) return;
             _chapters = chapters;
@@ -1944,30 +2330,51 @@ class _EpubViewerScreenState extends State<EpubViewerScreen>
                 if (reported > 0 || _readProgress == 0) {
                   _readProgress = reported;
                 }
+                _menu = null;
                 _updateBookmarkState();
               });
             }
           },
           onTextSelected: (sel) {
+            if (generation != _viewerGeneration) return;
             _selectedCfi = sel.selectionCfi;
             _selectedText = sel.selectedText;
             _hasSelection = true;
           },
-          onDeselection: () => _hasSelection = false,
+          onSelection: (text, cfi, rect, viewRect) {
+            if (!mounted || generation != _viewerGeneration) return;
+            if (cfi.isEmpty || _imageFocused) return;
+            setState(() => _menu = _ReaderMenu(rect, const []));
+          },
+          onSelectionChanging: () {
+            if (mounted && (_menu?.forSelection ?? false)) {
+              setState(() => _menu = null);
+            }
+          },
+          onDeselection: () {
+            _hasSelection = false;
+            if (mounted && (_menu?.forSelection ?? false)) {
+              setState(() => _menu = null);
+            }
+          },
           onTouchDown: _onBookTouchDown,
           onTouchUp: _onBookTouchUp,
-          onAnnotationClicked: (cfi, data) => _onAnnotationClicked(cfi),
         ),
-        if (_pageTurn == EpubPageTurn.fastFade && !_isScrollMode)
+        // Page turn in progress: stills of the page over the book (see
+        // _turnPage). Touches on the book wait until the turn is done.
+        if (_turnCover != null || _turnImage != null)
           Positioned.fill(
-            child: IgnorePointer(
-              child: AnimatedBuilder(
-                animation: _pageFade,
-                builder: (context, _) => ColoredBox(
-                  color: (isDark ? AppColors.darkBackground : Colors.white)
-                      .withValues(alpha: _pageFade.value),
-                ),
-              ),
+            child: AbsorbPointer(
+              child: Stack(fit: StackFit.expand, children: [
+                // The stills have transparent margins (the web view is
+                // transparent there), so they sit on the page colour.
+                if (_turnCover != null)
+                  ColoredBox(
+                      color: pageColor,
+                      child: RawImage(image: _turnCover, fit: BoxFit.fill)),
+                if (_turnImage != null)
+                  _buildTurningPage(_turnImage!, pageColor),
+              ]),
             ),
           ),
         // iOS paginated mode: visible previous/next buttons. Swipe-to-turn goes
@@ -2008,13 +2415,58 @@ class _EpubViewerScreenState extends State<EpubViewerScreen>
           Positioned.fill(
               child: EpubLineGuide(
                   dimming: _guideDimming, accentColor: _readerAccent)),
+        if (_isEpubReady && _menu != null)
+          _buildMenu(_menu!, constraints.biggest, isDark),
         if (!_isEpubReady)
           Container(
-              color: isDark ? AppColors.darkBackground : Colors.white,
+              color: pageColor,
               child: Center(
                   child: CircularProgressIndicator(color: _readerAccent))),
       ]);
     });
+  }
+
+  /// The page that moves during a turn. [_turnAnim] runs 0→1 for "next"
+  /// (the old page leaves) and 1→0 for "previous" (the previous page comes
+  /// back), so one drawing serves both directions.
+  Widget _buildTurningPage(ui.Image image, Color pageColor) {
+    final still = ColoredBox(
+        color: pageColor, child: RawImage(image: image, fit: BoxFit.fill));
+    switch (_turnStyle) {
+      case EpubPageTurn.curl:
+        return PageCurl(
+            program: _curlProgram!,
+            image: image,
+            progress: _turnCurve,
+            paperColor: _isDarkMode ? const Color(0xff121212) : Colors.white,
+            backgroundColor: pageColor);
+      case EpubPageTurn.fastFade:
+        return AnimatedBuilder(
+          animation: _turnAnim,
+          builder: (context, child) =>
+              Opacity(opacity: 1 - _turnAnim.value, child: child),
+          child: still,
+        );
+      case EpubPageTurn.slide:
+        return LayoutBuilder(
+          builder: (context, constraints) => AnimatedBuilder(
+            animation: _turnCurve,
+            builder: (context, child) => Transform.translate(
+              offset: Offset(-constraints.maxWidth * _turnCurve.value, 0),
+              child: child,
+            ),
+            child: DecoratedBox(
+              decoration: const BoxDecoration(boxShadow: [
+                BoxShadow(
+                    color: Color(0x33000000),
+                    blurRadius: 18,
+                    offset: Offset(6, 0)),
+              ]),
+              child: still,
+            ),
+          ),
+        );
+    }
   }
 
   /// Called on every layout of the book view. When its size changes after
@@ -2025,10 +2477,16 @@ class _EpubViewerScreenState extends State<EpubViewerScreen>
     final previous = _bookViewSize;
     _bookViewSize = size;
     if (previous == null || previous == size || !_isEpubReady) return;
+    // A menu anchored to the old layout would point at the wrong text.
+    if (_menu != null) {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (mounted && _menu != null) _clearSelection();
+      });
+    }
     _reanchorTimer?.cancel();
     _reanchorTimer = Timer(const Duration(milliseconds: 400), () {
       final cfi = _currentCfi;
-      if (!mounted || cfi == null || cfi.isEmpty) return;
+      if (!mounted || cfi == null || cfi.isEmpty || _turning) return;
       _epubController.display(cfi: cfi);
     });
   }
@@ -2132,6 +2590,10 @@ class _EpubViewerScreenState extends State<EpubViewerScreen>
               _downloadProgress = 0;
               _isEpubReady = false;
               _dataLoaded = false;
+              _annotations.clear();
+              _standaloneNotes.clear();
+              _bookmarkCfis.clear();
+              _menu = null;
             });
             _loadEpub();
           },
