@@ -696,10 +696,11 @@ class AppRouter {
             pageBuilder: (context, state) {
               final documentId = state.uri.queryParameters['documentId'];
               final epubUrl = state.uri.queryParameters['epubUrl'];
+              final source = state.uri.queryParameters['source'];
               final title = state.uri.queryParameters['title'] ?? 'Reader';
               return CustomTransitionPage(
                 key: state.pageKey,
-                child: EpubViewerScreen(documentId: documentId, epubUrl: epubUrl, title: title),
+                child: EpubViewerScreen(documentId: documentId, epubUrl: epubUrl, source: source, title: title),
                 transitionsBuilder: (context, animation, secondaryAnimation, child) {
                   return SlideTransition(
                     position: Tween<Offset>(

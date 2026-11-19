@@ -10,6 +10,9 @@ import 'package:pgme/core/models/book_model.dart';
 import 'package:pgme/core/models/gateway_models.dart';
 import 'package:pgme/core/services/book_service.dart';
 import 'package:pgme/core/services/ebook_access_service.dart';
+import 'package:pgme/core/services/download_service.dart';
+import 'package:pgme/core/services/storage_service.dart';
+import 'package:pgme/core/utils/epub_file.dart';
 import 'package:pgme/core/services/pdf_cache_service.dart';
 import 'package:pgme/core/widgets/gateway_widget.dart';
 import 'package:pgme/core/widgets/address_bottom_sheet.dart';
@@ -303,7 +306,7 @@ class _EbookListScreenState extends State<EbookListScreen>
       if (mounted) {
         final url = data['url'] as String?;
         final title = data['title'] as String? ?? book.title;
-        final fileFormat = (data['file_format'] as String?) ?? 'pdf';
+        final fileFormat = (data['file_format'] as String? ?? 'pdf').toLowerCase();
         if (url != null) {
           if (fileFormat == 'epub') {
             context.pushNamed(
@@ -328,6 +331,21 @@ class _EbookListScreenState extends State<EbookListScreen>
         }
       }
     } catch (e) {
+      if (isNoConnectionError(e) &&
+          book.ebookFileFormat?.toLowerCase() == 'epub') {
+        final userId = await StorageService().getUserId();
+        final path = userId == null ? null : await DownloadService().getDownloadedPath(
+            epubDownloadFileName(userId, book.bookId, isDocument: false));
+        if (path != null && await isEpubArchive(File(path))) {
+          if (mounted) {
+            context.pushNamed('epub-viewer', queryParameters: {
+              'documentId': book.bookId,
+              'title': book.title,
+            });
+          }
+          return;
+        }
+      }
       // Offline: a PDF already on this device still opens (the reader falls
       // back to it when the server can't be reached).
       if (isNoConnectionError(e) &&

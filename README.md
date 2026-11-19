@@ -212,7 +212,7 @@ flutter build appbundle --release
 
 **iOS**
 ```bash
-flutter build ios --release
+flutter build ios --release -t lib/main_ios.dart
 ```
 
 ## 🔧 Configuration

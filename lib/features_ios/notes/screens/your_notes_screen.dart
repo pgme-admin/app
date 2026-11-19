@@ -1,3 +1,4 @@
+import 'dart:io';
 import 'package:flutter/material.dart';
 import 'package:go_router/go_router.dart';
 import 'package:provider/provider.dart';
@@ -8,6 +9,8 @@ import 'package:pgme/core_ios/constants/api_constants.dart';
 import 'package:pgme/core_ios/services/api_service.dart';
 import 'package:pgme/core_ios/services/dashboard_service.dart';
 import 'package:pgme/core_ios/services/download_service.dart';
+import 'package:pgme/core_ios/services/storage_service.dart';
+import 'package:pgme/core/utils/epub_file.dart';
 import 'package:pgme/core_ios/services/ebook_access_service.dart';
 import 'package:pgme/core_ios/utils/responsive_helper.dart';
 import 'package:pgme/core_ios/widgets/app_dialog.dart';
@@ -138,14 +141,27 @@ class _YourNotesScreenState extends State<YourNotesScreen> {
 
   /// Check which documents are already downloaded
   Future<void> _checkDownloadedDocs() async {
+    final userId = await StorageService().getUserId();
     for (final item in _libraryItems) {
-      final fileName = 'doc_${item.documentId}.pdf';
-      final downloaded = await _downloadService.isDownloaded(fileName);
+      final fileName = item.fileFormat.toLowerCase() == 'epub'
+          ? (userId == null ? null : epubDownloadFileName(
+              userId, item.documentId, isDocument: true))
+          : 'doc_${item.documentId}.${item.fileFormat.toLowerCase()}';
+      if (fileName == null) continue;
+      final path = await _downloadService.getDownloadedPath(fileName);
+      final downloaded = path != null &&
+          (item.fileFormat.toLowerCase() != 'epub' || await isEpubArchive(File(path)));
       if (downloaded) _downloadedDocIds.add(item.documentId);
     }
     for (final item in _purchasedEbookItems) {
-      final fileName = 'ebook_${item.documentId}.pdf';
-      final downloaded = await _downloadService.isDownloaded(fileName);
+      final fileName = item.fileFormat.toLowerCase() == 'epub'
+          ? (userId == null ? null : epubDownloadFileName(
+              userId, item.documentId, isDocument: false))
+          : 'ebook_${item.documentId}.${item.fileFormat.toLowerCase()}';
+      if (fileName == null) continue;
+      final path = await _downloadService.getDownloadedPath(fileName);
+      final downloaded = path != null &&
+          (item.fileFormat.toLowerCase() != 'epub' || await isEpubArchive(File(path)));
       if (downloaded) _downloadedDocIds.add(item.documentId);
     }
     if (mounted) setState(() {});
@@ -171,25 +187,34 @@ class _YourNotesScreenState extends State<YourNotesScreen> {
     try {
       String url;
       String fileName;
+      final userId = item.fileFormat.toLowerCase() == 'epub'
+          ? await StorageService().getUserId() : null;
+      if (item.fileFormat.toLowerCase() == 'epub' && userId == null) {
+        throw StateError('Sign in to download this EPUB');
+      }
 
       if (_isEbookItem(item)) {
         debugPrint('[PDF-DBG] your_notes._downloadDocument resolving via EbookAccessService');
         final data = await _ebookAccessService.getEbookViewUrl(docId);
         url = data['url'] as String;
-        fileName = 'ebook_$docId.pdf';
+        fileName = item.fileFormat.toLowerCase() == 'epub'
+            ? epubDownloadFileName(userId!, docId, isDocument: false)
+            : 'ebook_$docId.${item.fileFormat.toLowerCase()}';
       } else {
         debugPrint('[PDF-DBG] your_notes._downloadDocument resolving via documentViewUrl');
         final response = await ApiService().dio.get(
           ApiConstants.documentViewUrl(docId),
         );
         url = response.data['data']['url'] as String;
-        fileName = 'doc_$docId.pdf';
+        fileName = item.fileFormat.toLowerCase() == 'epub'
+            ? epubDownloadFileName(userId!, docId, isDocument: true)
+            : 'doc_$docId.${item.fileFormat.toLowerCase()}';
       }
       debugPrint(
           '[PDF-DBG] your_notes._downloadDocument resolved fileName=$fileName '
           'urlLen=${url.length}');
 
-      await _downloadService.downloadFile(
+      final downloadedPath = await _downloadService.downloadFile(
         url: url,
         fileName: fileName,
         onProgress: (progress) {
@@ -200,6 +225,11 @@ class _YourNotesScreenState extends State<YourNotesScreen> {
           }
         },
       );
+      if (item.fileFormat.toLowerCase() == 'epub' &&
+          !await isEpubArchive(File(downloadedPath))) {
+        await _downloadService.deleteDownload(fileName);
+        throw const FormatException('Downloaded file is not a valid EPUB');
+      }
 
       if (mounted) {
         setState(() {
@@ -234,7 +264,7 @@ class _YourNotesScreenState extends State<YourNotesScreen> {
       if (mounted) {
         final url = data['url'] as String?;
         final title = data['title'] as String? ?? item.title;
-        final fileFormat = (data['file_format'] as String?) ?? 'pdf';
+        final fileFormat = (data['file_format'] as String? ?? 'pdf').toLowerCase();
         if (url != null) {
           if (fileFormat == 'epub') {
             context.pushNamed(
@@ -258,6 +288,21 @@ class _YourNotesScreenState extends State<YourNotesScreen> {
         }
       }
     } catch (e) {
+      if (isLegacyEbookNetworkError(e) &&
+          item.fileFormat.toLowerCase() == 'epub') {
+        final userId = await StorageService().getUserId();
+        final path = userId == null ? null : await _downloadService.getDownloadedPath(
+            epubDownloadFileName(userId, item.documentId, isDocument: false));
+        if (path != null && await isEpubArchive(File(path))) {
+          if (mounted) {
+            context.pushNamed('epub-viewer', queryParameters: {
+              'documentId': item.documentId,
+              'title': item.title,
+            });
+          }
+          return;
+        }
+      }
       if (mounted) {
         showAppDialog(context, message: 'Failed to open eBook: ${e.toString().replaceAll("Exception: ", "")}');
       }
@@ -757,10 +802,11 @@ class _YourNotesScreenState extends State<YourNotesScreen> {
             _openEbook(item);
           } else {
             context.pushNamed(
-              'pdf-viewer',
+              item.fileFormat.toLowerCase() == 'epub' ? 'epub-viewer' : 'pdf-viewer',
               queryParameters: {
                 'documentId': item.documentId,
                 'title': item.title,
+                if (item.fileFormat.toLowerCase() == 'epub') 'source': 'document',
               },
             );
           }

@@ -1,3 +1,4 @@
+import 'dart:io';
 import 'package:flutter/material.dart';
 import 'package:go_router/go_router.dart';
 import 'package:provider/provider.dart';
@@ -7,6 +8,9 @@ import 'package:pgme/core_ios/theme/app_theme.dart';
 import 'package:pgme/core_ios/models/book_model.dart';
 import 'package:pgme/core_ios/services/book_service.dart';
 import 'package:pgme/core_ios/services/ebook_access_service.dart';
+import 'package:pgme/core_ios/services/download_service.dart';
+import 'package:pgme/core_ios/services/storage_service.dart';
+import 'package:pgme/core/utils/epub_file.dart';
 import 'package:pgme/core_ios/utils/responsive_helper.dart';
 import 'package:pgme/core_ios/utils/web_store_launcher.dart';
 import 'package:pgme/core_ios/widgets/app_dialog.dart';
@@ -194,7 +198,7 @@ class _EbookListScreenState extends State<EbookListScreen>
       if (mounted) {
         final url = data['url'] as String?;
         final title = data['title'] as String? ?? book.title;
-        final fileFormat = (data['file_format'] as String?) ?? 'pdf';
+        final fileFormat = (data['file_format'] as String? ?? 'pdf').toLowerCase();
         if (url != null) {
           if (fileFormat == 'epub') {
             context.pushNamed(
@@ -219,6 +223,21 @@ class _EbookListScreenState extends State<EbookListScreen>
         }
       }
     } catch (e) {
+      if (isLegacyEbookNetworkError(e) &&
+          book.ebookFileFormat?.toLowerCase() == 'epub') {
+        final userId = await StorageService().getUserId();
+        final path = userId == null ? null : await DownloadService().getDownloadedPath(
+            epubDownloadFileName(userId, book.bookId, isDocument: false));
+        if (path != null && await isEpubArchive(File(path))) {
+          if (mounted) {
+            context.pushNamed('epub-viewer', queryParameters: {
+              'documentId': book.bookId,
+              'title': book.title,
+            });
+          }
+          return;
+        }
+      }
       if (mounted) {
         _showError('Failed to open eBook: ${e.toString().replaceAll("Exception: ", "")}');
       }

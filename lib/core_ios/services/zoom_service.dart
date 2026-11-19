@@ -209,37 +209,12 @@ class ZoomMeetingService {
       final isHost = _isHostRole(zoomSignature.signature);
       debugPrint('Zoom role: ${isHost ? 'HOST' : 'PARTICIPANT'}');
 
-      // Apply UI restrictions based on role — participants get locked down,
-      // hosts get full controls. All done client-side, no backend change needed.
-      final meetingConfig = isHost
-          ? ZoomMeetingSdkRequest(
-              meetingNumber: zoomSignature.meetingNumber,
-              password: zoomSignature.password,
-              displayName: displayName,
-              noInvite: true,
-              noDriveMode: true,
-              noDialIn: true,
-              noDialOut: true,
-            )
-          : ZoomMeetingSdkRequest(
-              meetingNumber: zoomSignature.meetingNumber,
-              password: zoomSignature.password,
-              displayName: displayName,
-              noShare: true,
-              noVideo: true,
-              noInvite: true,
-              noChat: true,
-              noDriveMode: true,
-              noDialIn: true,
-              noDialOut: true,
-              noDisconnectAudio: true,
-              noRecord: true,
-              noReaction: true,
-              noParticipantList: true,
-              noMore: true,
-              muteOnEntry: true,
-              videoOffOnEntry: true,
-            );
+      // The bundled Zoom SDK request accepts meeting credentials only.
+      final meetingConfig = ZoomMeetingSdkRequest(
+        meetingNumber: zoomSignature.meetingNumber,
+        password: zoomSignature.password,
+        displayName: displayName,
+      );
 
       // Set up status listener with timeout
       final completer = Completer<bool>();

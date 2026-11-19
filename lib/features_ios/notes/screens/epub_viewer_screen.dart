@@ -12,6 +12,17 @@ import 'package:pgme/core_ios/providers/theme_provider.dart';
 import 'package:pgme/core_ios/services/bookmark_service.dart';
 import 'package:pgme/core_ios/services/download_service.dart';
 import 'package:pgme/core_ios/services/ebook_access_service.dart';
+import 'package:pgme/core_ios/services/api_service.dart';
+import 'package:pgme/core_ios/services/storage_service.dart';
+import 'package:pgme/core_ios/constants/api_constants.dart';
+import 'package:pgme/core/utils/epub_file.dart';
+import 'package:pgme/core/utils/epub_image_zoom.dart';
+import 'package:pgme/core/utils/epub_search.dart';
+import 'package:pgme/core/utils/epub_reader_theme.dart';
+import 'package:pgme/core/widgets/epub_line_guide.dart';
+import 'package:pgme/core/widgets/epub_appearance_sheet.dart';
+import 'package:pgme/core/widgets/epub_navigation_sheet.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 import 'package:pgme/core_ios/services/highlight_service.dart';
 import 'package:pgme/core_ios/theme/app_theme.dart';
 import 'package:pgme/core_ios/utils/responsive_helper.dart';
@@ -20,12 +31,14 @@ import 'package:pgme/core_ios/widgets/app_dialog.dart';
 class EpubViewerScreen extends StatefulWidget {
   final String? documentId;
   final String? epubUrl;
+  final String? source;
   final String title;
 
   const EpubViewerScreen({
     super.key,
     this.documentId,
     this.epubUrl,
+    this.source,
     this.title = 'Reader',
   });
 
@@ -39,14 +52,26 @@ class _EpubViewerScreenState extends State<EpubViewerScreen> {
   final BookmarkService _bookmarkService = BookmarkService();
 
   String? _localPath;
+  Timer? _readerTimeout;
+  CancelToken? _downloadCancelToken;
   bool _isLoading = true;
   bool _isEpubReady = false;
+  bool _chaptersReady = false;
+  bool _pageDisplayed = false;
   double _downloadProgress = 0;
   double _readProgress = 0;
   String? _error;
   bool _isSearchOpen = false;
+  bool _isSearchBusy = false;
   bool _isDarkMode = false;
   bool _isScrollMode = false;
+  int _fontSize = 15;
+  bool _twoPageLayout = true;
+  EpubReadingTheme _readingTheme = EpubReadingTheme.followApp;
+  EpubReadingFont _readingFont = EpubReadingFont.original;
+  bool _portraitLock = false;
+  bool _lineGuide = false;
+  double _guideDimming = 0.4;
 
   // Current selection
   String? _selectedCfi;
@@ -55,9 +80,13 @@ class _EpubViewerScreenState extends State<EpubViewerScreen> {
   // Current location
   String _currentChapter = '';
   String? _currentCfi;
+  String? _readerUserId;
+  String? _resumeCfi;
+  int _viewerGeneration = 0;
 
   // Bookmarks — bookmarkId -> cfi (stored in bookmark's `note` field)
   final Map<String, String> _bookmarkCfis = {};
+  List<EpubChapter> _chapters = [];
   bool _isCurrentLocationBookmarked = false;
   String? _currentBookmarkId;
 
@@ -78,58 +107,301 @@ class _EpubViewerScreenState extends State<EpubViewerScreen> {
     super.initState();
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (mounted) {
-        _isDarkMode =
+        final darkMode =
             Provider.of<ThemeProvider>(context, listen: false).isDarkMode;
+        if (_readingTheme == EpubReadingTheme.followApp &&
+            _isDarkMode != darkMode) {
+          setState(() => _isDarkMode = darkMode);
+          if (_isEpubReady) {
+            unawaited(_epubController.updateTheme(
+                theme: _currentReadingTheme()));
+          }
+        }
       }
     });
+    _loadAppearance();
     _loadEpub();
+  }
+
+  @override
+  void dispose() {
+    _readerTimeout?.cancel();
+    _downloadCancelToken?.cancel();
+    if (_portraitLock) {
+      unawaited(SystemChrome.setPreferredOrientations(
+          _defaultReaderOrientations()));
+    }
+    super.dispose();
+  }
+
+  Future<void> _loadAppearance() async {
+    final prefs = await SharedPreferences.getInstance();
+    if (!mounted) return;
+    final theme = readingThemeFromName(prefs.getString('epub_reading_theme'));
+    final font = readingFontFromName(prefs.getString('epub_reading_font'));
+    final savedScroll = prefs.getBool('epub_scroll_mode') ?? false;
+    final modeChanged = savedScroll != _isScrollMode;
+    final appDark = Provider.of<ThemeProvider>(context, listen: false).isDarkMode;
+    setState(() {
+      _fontSize = (prefs.getInt('epub_font_size') ?? 15).clamp(13, 24).toInt();
+      _twoPageLayout = prefs.getBool('epub_two_page_layout') ?? true;
+      _readingTheme = theme;
+      _readingFont = font;
+      _isDarkMode = readingThemeIsDark(theme, appDark);
+      _portraitLock = prefs.getBool('epub_portrait_lock') ?? false;
+      _lineGuide = prefs.getBool('epub_line_guide') ?? false;
+      _guideDimming =
+          (prefs.getDouble('epub_guide_dimming') ?? 0.4).clamp(0.0, 0.7).toDouble();
+    });
+    if (_portraitLock) {
+      unawaited(SystemChrome.setPreferredOrientations(
+          const [DeviceOrientation.portraitUp, DeviceOrientation.portraitDown]));
+    }
+    if (_isEpubReady) {
+      unawaited(_epubController.setFontSize(fontSize: _fontSize.toDouble()));
+      unawaited(_applySpread(_twoPageLayout));
+      unawaited(_epubController.updateTheme(theme: _currentReadingTheme()));
+    }
+    if (modeChanged) _setReadingMode(savedScroll);
+  }
+
+  Future<void> _applySpread(bool twoPages) async {
+    // flutter_epub_viewer 1.2.8 passes the enum's toString() to epub.js;
+    // epub.js expects the bare value ('auto' or 'none').
+    await _epubController.webViewController?.evaluateJavascript(
+        source: 'setSpread("${twoPages ? 'auto' : 'none'}")');
+    final cfi = _currentCfi;
+    if (mounted && cfi != null && cfi.isNotEmpty) {
+      _epubController.display(cfi: cfi);
+    }
+  }
+
+  Future<void> _showNavigation() async {
+    final cfi = await showEpubNavigationSheet(context, _chapters, _bookmarkCfis);
+    if (mounted && cfi != null) _epubController.display(cfi: cfi);
+  }
+
+  void _showAppearanceSettings() {
+    showEpubAppearanceSheet(
+      context,
+      fontSize: _fontSize,
+      isTablet: ResponsiveHelper.isTablet(context),
+      twoPageLayout: _twoPageLayout,
+      isScrollMode: _isScrollMode,
+      portraitLock: _portraitLock,
+      lineGuide: _lineGuide,
+      guideDimming: _guideDimming,
+      readingTheme: _readingTheme,
+      readingFont: _readingFont,
+      accentColor: AppColors.primaryBlue,
+      onFontSizeChanged: (value) {
+        setState(() => _fontSize = value);
+        if (_isEpubReady) {
+          unawaited(_epubController.setFontSize(fontSize: value.toDouble()));
+        }
+        SharedPreferences.getInstance().then(
+            (prefs) => prefs.setInt('epub_font_size', value));
+      },
+      onTwoPageLayoutChanged: (value) {
+        setState(() => _twoPageLayout = value);
+        if (_isEpubReady) unawaited(_applySpread(value));
+        SharedPreferences.getInstance().then(
+            (prefs) => prefs.setBool('epub_two_page_layout', value));
+      },
+      onReadingModeChanged: _setReadingMode,
+      onReadingThemeChanged: _setReadingTheme,
+      onReadingFontChanged: _setReadingFont,
+      onPortraitLockChanged: _setPortraitLock,
+      onLineGuideChanged: (value) {
+        setState(() => _lineGuide = value);
+        SharedPreferences.getInstance().then(
+            (prefs) => prefs.setBool('epub_line_guide', value));
+      },
+      onGuideDimmingChanged: (value) {
+        setState(() => _guideDimming = value);
+        SharedPreferences.getInstance().then(
+            (prefs) => prefs.setDouble('epub_guide_dimming', value));
+      },
+    );
+  }
+
+  EpubTheme _currentReadingTheme() => epubReadingTheme(
+      _readingTheme,
+      _readingFont,
+      Provider.of<ThemeProvider>(context, listen: false).isDarkMode);
+
+  void _setReadingTheme(EpubReadingTheme value) {
+    if (_readingTheme == value) return;
+    final appDark = Provider.of<ThemeProvider>(context, listen: false).isDarkMode;
+    setState(() {
+      _readingTheme = value;
+      _isDarkMode = readingThemeIsDark(value, appDark);
+    });
+    if (_isEpubReady) {
+      unawaited(_epubController.updateTheme(theme: _currentReadingTheme()));
+    }
+    SharedPreferences.getInstance().then(
+        (prefs) => prefs.setString('epub_reading_theme', value.name));
+  }
+
+  void _setReadingFont(EpubReadingFont value) {
+    if (_readingFont == value) return;
+    setState(() => _readingFont = value);
+    if (_isEpubReady) {
+      unawaited(_epubController.updateTheme(theme: _currentReadingTheme()));
+    }
+    SharedPreferences.getInstance().then(
+        (prefs) => prefs.setString('epub_reading_font', value.name));
+  }
+
+  List<DeviceOrientation> _defaultReaderOrientations() => Platform.isIOS
+      ? const [
+          DeviceOrientation.portraitUp, DeviceOrientation.portraitDown,
+          DeviceOrientation.landscapeLeft, DeviceOrientation.landscapeRight,
+        ]
+      : ResponsiveHelper.supportedOrientationsForDevice();
+
+  void _setPortraitLock(bool value) {
+    if (_portraitLock == value) return;
+    setState(() => _portraitLock = value);
+    unawaited(SystemChrome.setPreferredOrientations(value
+        ? const [DeviceOrientation.portraitUp, DeviceOrientation.portraitDown]
+        : _defaultReaderOrientations()));
+    SharedPreferences.getInstance().then(
+        (prefs) => prefs.setBool('epub_portrait_lock', value));
+  }
+
+  void _startReaderTimeout(String path) {
+    _readerTimeout?.cancel();
+    _readerTimeout = Timer(const Duration(seconds: 90), () async {
+      if (!mounted || _isEpubReady) return;
+      // A ZIP may have a valid header but an unreadable EPUB package.
+      try { await File(path).delete(); } catch (_) {}
+      final id = widget.documentId;
+      final userId = _readerUserId;
+      if (id != null && userId != null) {
+        final prefs = await SharedPreferences.getInstance();
+        await prefs.remove('epub_position_${userId}_${widget.source ?? 'ebook'}_$id');
+        _resumeCfi = null;
+      }
+      if (mounted) setState(() {
+        _error = 'This EPUB could not be opened. Tap Retry to download it again.';
+        _localPath = null;
+      });
+    });
+  }
+
+  void _showLocalEpub(String path) {
+    if (!mounted) return;
+    _chaptersReady = false;
+    _pageDisplayed = false;
+    setState(() {
+      _viewerGeneration++;
+      _localPath = path;
+      _isLoading = false;
+    });
+    _startReaderTimeout(path);
+  }
+
+  void _markReaderReady() {
+    if (!mounted || _error != null || _isEpubReady ||
+        !_chaptersReady || !_pageDisplayed) return;
+    _readerTimeout?.cancel();
+    setState(() => _isEpubReady = true);
+    if (_dataLoaded) {
+      _reapplyAnnotations();
+    } else {
+      _loadData();
+    }
+    unawaited(installEpubImageZoom(_epubController).catchError(
+        (Object e) => debugPrint('[EPUB] Image zoom unavailable: $e')));
   }
 
   // ── EPUB loading ──────────────────────────────────────────────────
 
   Future<void> _loadEpub() async {
+    File? partFile;
     try {
-      if (widget.documentId != null) {
-        final ebookFileName = 'ebook_${widget.documentId}.epub';
-        final downloadedPath =
-            await DownloadService().getDownloadedPath(ebookFileName);
+      final userId = await StorageService().getUserId();
+      _readerUserId = userId;
+      if (widget.documentId != null && userId != null) {
+        final prefs = await SharedPreferences.getInstance();
+        _resumeCfi = prefs.getString(
+            'epub_position_${userId}_${widget.source ?? 'ebook'}_${widget.documentId}');
+      }
+      final id = widget.documentId;
+      final isDocument = widget.source == 'document';
+      final prefix = isDocument ? 'doc' : 'ebook';
+      if (id != null && userId != null) {
+        final downloadedPath = await DownloadService().getDownloadedPath(
+            epubDownloadFileName(userId, id, isDocument: isDocument));
         if (downloadedPath != null) {
           final file = File(downloadedPath);
-          if (await file.exists() && await file.length() > 0) {
-            if (mounted) setState(() { _localPath = downloadedPath; _isLoading = false; });
+          if (await isEpubArchive(file)) {
+            _showLocalEpub(downloadedPath);
             return;
           }
+          // An older download may contain a PDF or an interrupted response.
+          await file.delete();
         }
       }
 
-      String epubUrl;
-      if (widget.epubUrl != null) {
-        epubUrl = widget.epubUrl!;
-      } else if (widget.documentId != null) {
-        final data = await EbookAccessService().getEbookViewUrl(widget.documentId!);
-        epubUrl = data['url'] as String;
+      // Revalidate access before using the temporary cache. A different user
+      // on the same device must not open a previously viewed paid book.
+      String? url;
+      if (id != null && isDocument) {
+        final response = await ApiService().dio.get(ApiConstants.documentViewUrl(id));
+        url = response.data['data']['url'] as String?;
+      } else if (id != null) {
+        final data = await EbookAccessService().getEbookViewUrl(id);
+        url = data['url'] as String?;
       } else {
-        throw Exception('No EPUB source provided');
+        url = widget.epubUrl;
       }
+      if (url == null || url.isEmpty) throw StateError('No EPUB file URL');
       if (!mounted) return;
 
+      // Uploads use a new object path, so a replaced book cannot reuse its
+      // previous temporary copy. Query parameters on signed URLs are ignored.
+      final objectName = Uri.parse(url).pathSegments.last
+          .replaceAll(RegExp(r'[^a-zA-Z0-9._-]'), '_');
       final dir = await getTemporaryDirectory();
-      final fileName = 'pgme_epub_${widget.documentId ?? epubUrl.hashCode}.epub';
-      final filePath = '${dir.path}/$fileName';
+      final filePath = '${dir.path}/pgme_epub_${prefix}_${id ?? 'external'}_$objectName.epub';
       final file = File(filePath);
-
-      if (await file.exists() && await file.length() > 0) {
-        if (mounted) setState(() { _localPath = filePath; _isLoading = false; });
+      if (await isEpubArchive(file)) {
+        _showLocalEpub(filePath);
         return;
       }
+      if (await file.exists()) await file.delete();
 
-      await Dio().download(epubUrl, filePath, onReceiveProgress: (received, total) {
-        if (total > 0 && mounted) setState(() => _downloadProgress = received / total);
+      partFile = File('$filePath.part.${DateTime.now().microsecondsSinceEpoch}');
+      _downloadCancelToken = CancelToken();
+      await Dio(BaseOptions(
+        connectTimeout: const Duration(seconds: 20),
+        receiveTimeout: const Duration(minutes: 5),
+      )).download(url, partFile.path,
+          cancelToken: _downloadCancelToken,
+          onReceiveProgress: (received, total) {
+        if (total > 0 && mounted) {
+          setState(() => _downloadProgress = received / total);
+        }
       });
-      if (mounted) setState(() { _localPath = filePath; _isLoading = false; });
+      if (!await isEpubArchive(partFile)) {
+        throw const FormatException('The downloaded file is not an EPUB archive');
+      }
+      await partFile.rename(filePath);
+      _showLocalEpub(filePath);
     } catch (e) {
       debugPrint('EPUB load error: $e');
-      if (mounted) setState(() { _error = 'Failed to load EPUB'; _isLoading = false; });
+      if (partFile != null && await partFile.exists()) await partFile.delete();
+      if (mounted) {
+        setState(() {
+          _error = e is FormatException
+              ? 'This file is not a valid EPUB. Please contact support.'
+              : 'Could not download this EPUB. Please try again.';
+          _isLoading = false;
+        });
+      }
     }
   }
 
@@ -770,11 +1042,7 @@ class _EpubViewerScreenState extends State<EpubViewerScreen> {
                     color: _isCurrentLocationBookmarked ? AppColors.primaryBlue : textColor))),
             // Scroll/page toggle
             GestureDetector(
-              onTap: () {
-                setState(() => _isScrollMode = !_isScrollMode);
-                _epubController.setFlow(
-                  flow: _isScrollMode ? EpubFlow.scrolled : EpubFlow.paginated);
-              },
+              onTap: _toggleReadingMode,
               child: Container(
                 width: isTablet ? 44 : 36, height: isTablet ? 44 : 36,
                 margin: EdgeInsets.only(right: isTablet ? 4 : 2),
@@ -788,11 +1056,8 @@ class _EpubViewerScreenState extends State<EpubViewerScreen> {
                   color: _isScrollMode ? AppColors.primaryBlue : textColor))),
             // Dark mode
             GestureDetector(
-              onTap: () {
-                setState(() => _isDarkMode = !_isDarkMode);
-                _epubController.updateTheme(
-                  theme: _isDarkMode ? EpubTheme.dark() : EpubTheme.light());
-              },
+              onTap: () => _setReadingTheme(_isDarkMode
+                  ? EpubReadingTheme.light : EpubReadingTheme.dark),
               child: Container(
                 width: isTablet ? 44 : 36, height: isTablet ? 44 : 36,
                 margin: EdgeInsets.only(right: isTablet ? 4 : 2),
@@ -830,9 +1095,21 @@ class _EpubViewerScreenState extends State<EpubViewerScreen> {
                 fillColor: isDark ? AppColors.darkSurface : const Color(0xFFF5F5F5),
                 border: OutlineInputBorder(borderRadius: BorderRadius.circular(isTablet ? 12 : 8), borderSide: BorderSide.none)),
               onSubmitted: (value) async {
-                if (value.isNotEmpty) {
-                  final results = await _epubController.search(query: value);
-                  if (results.isNotEmpty) _epubController.display(cfi: results.first.cfi);
+                if (value.trim().isNotEmpty && _isEpubReady && !_isSearchBusy) {
+                  _isSearchBusy = true;
+                  try {
+                    final results = await searchEpubBook(_epubController, value);
+                    if (!mounted) return;
+                    final cfi = await showEpubSearchResults(context, results);
+                    if (mounted && cfi != null) _epubController.display(cfi: cfi);
+                  } catch (e) {
+                    if (mounted) {
+                      showAppDialog(context,
+                          message: 'Search could not finish. Please try again.');
+                    }
+                  } finally {
+                    _isSearchBusy = false;
+                  }
                 }
               }),
           ],
@@ -856,6 +1133,10 @@ class _EpubViewerScreenState extends State<EpubViewerScreen> {
               _underlineSelected, isDark, isTablet),
           _bottomAction(Icons.sticky_note_2_outlined, 'Notes', const Color(0xFF43A047),
               _showNotesPanel, isDark, isTablet),
+          _bottomAction(Icons.text_fields, 'Text', AppColors.primaryBlue,
+              _showAppearanceSettings, isDark, isTablet),
+          _bottomAction(Icons.menu_book_outlined, 'Contents', AppColors.primaryBlue,
+              _showNavigation, isDark, isTablet),
         ])),
     );
   }
@@ -878,19 +1159,58 @@ class _EpubViewerScreenState extends State<EpubViewerScreen> {
         ])));
   }
 
+  void _toggleReadingMode() => _setReadingMode(!_isScrollMode);
+
+  void _setReadingMode(bool scroll) {
+    if (_isScrollMode == scroll) return;
+    setState(() {
+      _isScrollMode = scroll;
+      if (_localPath != null) {
+        _resumeCfi = _currentCfi ?? _resumeCfi;
+        _viewerGeneration++;
+        _isEpubReady = false;
+        _chaptersReady = false;
+        _pageDisplayed = false;
+      }
+    });
+    if (_localPath != null) _startReaderTimeout(_localPath!);
+    SharedPreferences.getInstance().then(
+        (prefs) => prefs.setBool('epub_scroll_mode', scroll));
+  }
+
+  void _reapplyAnnotations() {
+    for (final h in _highlights.values) {
+      final cfi = h['cfi'];
+      if (cfi != null && cfi.isNotEmpty) {
+        _epubController.addHighlight(
+            cfi: cfi, color: _colorFromName(h['color'] ?? 'yellow'));
+      }
+    }
+    for (final u in _underlines.values) {
+      final cfi = u['cfi'];
+      if (cfi != null && cfi.isNotEmpty) _epubController.addUnderline(cfi: cfi);
+    }
+  }
+
   Widget _buildEpubViewer(bool isDark) {
     final epubSource = _localPath != null
         ? EpubSource.fromFile(File(_localPath!))
         : EpubSource.fromUrl(widget.epubUrl!);
+    final generation = _viewerGeneration;
 
     return Stack(children: [
       EpubViewer(
+        key: ValueKey('epub-viewer-$_viewerGeneration'),
         epubSource: epubSource,
         epubController: _epubController,
+        initialCfi: _resumeCfi,
         displaySettings: EpubDisplaySettings(
+          fontSize: _fontSize,
+          spread: _twoPageLayout && ResponsiveHelper.isTablet(context)
+              ? EpubSpread.auto : EpubSpread.none,
           flow: _isScrollMode ? EpubFlow.scrolled : EpubFlow.paginated,
-          snap: true, useSnapAnimationAndroid: false,
-          theme: _isDarkMode ? EpubTheme.dark() : EpubTheme.light(),
+          snap: !_isScrollMode, useSnapAnimationAndroid: false,
+          theme: _currentReadingTheme(),
           allowScriptedContent: false),
         selectionContextMenu: ContextMenu(
           menuItems: [
@@ -901,17 +1221,30 @@ class _EpubViewerScreenState extends State<EpubViewerScreen> {
           ],
           settings: ContextMenuSettings(hideDefaultSystemContextMenuItems: true)),
         onChaptersLoaded: (chapters) {
-          if (!_isEpubReady && mounted) {
-            setState(() => _isEpubReady = true);
-            _loadData();
-          }
+          if (generation != _viewerGeneration) return;
+          _chapters = chapters;
+          _chaptersReady = true;
+          _markReaderReady();
         },
-        onEpubLoaded: () => debugPrint('EPUB loaded'),
+        onEpubLoaded: () {
+          if (generation != _viewerGeneration) return;
+          _pageDisplayed = true;
+          _markReaderReady();
+        },
         onRelocated: (value) {
+          if (generation != _viewerGeneration) return;
           if (mounted) {
             _currentCfi = value.startCfi;
+            if (widget.documentId != null && _readerUserId != null &&
+                value.startCfi.isNotEmpty) {
+              unawaited(SharedPreferences.getInstance().then((prefs) =>
+                  prefs.setString(
+                      'epub_position_${_readerUserId}_${widget.source ?? 'ebook'}_${widget.documentId}',
+                      value.startCfi)));
+            }
             setState(() {
-              _readProgress = value.progress;
+              _readProgress = value.progress.isFinite
+                  ? value.progress.clamp(0.0, 1.0) : 0.0;
               _updateBookmarkState();
             });
           }
@@ -922,6 +1255,9 @@ class _EpubViewerScreenState extends State<EpubViewerScreen> {
         },
         onAnnotationClicked: (cfi, data) => _onAnnotationClicked(cfi),
       ),
+      if (_isEpubReady && _lineGuide)
+        Positioned.fill(child: EpubLineGuide(
+          dimming: _guideDimming, accentColor: AppColors.primaryBlue)),
       if (!_isEpubReady)
         Container(
           color: isDark ? AppColors.darkBackground : Colors.white,

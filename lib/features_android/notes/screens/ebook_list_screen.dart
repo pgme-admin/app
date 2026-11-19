@@ -9,6 +9,9 @@ import 'package:pgme/core_android/models/book_model.dart';
 import 'package:pgme/core_android/models/gateway_models.dart';
 import 'package:pgme/core_android/services/book_service.dart';
 import 'package:pgme/core_android/services/ebook_access_service.dart';
+import 'package:pgme/core_android/services/download_service.dart';
+import 'package:pgme/core_android/services/storage_service.dart';
+import 'package:pgme/core/utils/epub_file.dart';
 import 'package:pgme/core_android/widgets/gateway_widget.dart';
 import 'package:pgme/core_android/widgets/address_bottom_sheet.dart';
 import 'package:pgme/core_android/models/address_model.dart';
@@ -293,7 +296,7 @@ class _EbookListScreenState extends State<EbookListScreen>
       if (mounted) {
         final url = data['url'] as String?;
         final title = data['title'] as String? ?? book.title;
-        final fileFormat = (data['file_format'] as String?) ?? 'pdf';
+        final fileFormat = (data['file_format'] as String? ?? 'pdf').toLowerCase();
         if (url != null) {
           if (fileFormat == 'epub') {
             context.pushNamed(
@@ -317,6 +320,21 @@ class _EbookListScreenState extends State<EbookListScreen>
         }
       }
     } catch (e) {
+      if (isLegacyEbookNetworkError(e) &&
+          book.ebookFileFormat?.toLowerCase() == 'epub') {
+        final userId = await StorageService().getUserId();
+        final path = userId == null ? null : await DownloadService().getDownloadedPath(
+            epubDownloadFileName(userId, book.bookId, isDocument: false));
+        if (path != null && await isEpubArchive(File(path))) {
+          if (mounted) {
+            context.pushNamed('epub-viewer', queryParameters: {
+              'documentId': book.bookId,
+              'title': book.title,
+            });
+          }
+          return;
+        }
+      }
       if (mounted) {
         _showError('Failed to open eBook: ${e.toString().replaceAll("Exception: ", "")}');
       }

@@ -856,7 +856,7 @@ class _AvailableNotesScreenState extends State<AvailableNotesScreen> {
                                   color: placeholderColor,
                                   child: Center(
                                     child: Icon(
-                                      Icons.picture_as_pdf,
+                                      document.fileFormat.toLowerCase() == 'epub' ? Icons.auto_stories : Icons.picture_as_pdf,
                                       size: isTablet ? 40 : 32,
                                       color: isDark ? AppColors.darkTextSecondary : const Color(0xFF666666),
                                     ),
@@ -868,7 +868,7 @@ class _AvailableNotesScreenState extends State<AvailableNotesScreen> {
                                   color: placeholderColor,
                                   child: Center(
                                     child: Icon(
-                                      Icons.picture_as_pdf,
+                                      document.fileFormat.toLowerCase() == 'epub' ? Icons.auto_stories : Icons.picture_as_pdf,
                                       size: isTablet ? 40 : 32,
                                       color: isDark ? AppColors.darkTextSecondary : const Color(0xFF666666),
                                     ),
@@ -1004,10 +1004,11 @@ class _AvailableNotesScreenState extends State<AvailableNotesScreen> {
                               child: ElevatedButton(
                                 onPressed: () {
                                   context.pushNamed(
-                                    'pdf-viewer',
+                                    document.fileFormat.toLowerCase() == 'epub' ? 'epub-viewer' : 'pdf-viewer',
                                     queryParameters: {
                                       'documentId': document.documentId,
                                       'title': document.title,
+                                      if (document.fileFormat.toLowerCase() == 'epub') 'source': 'document',
                                     },
                                   );
                                 },
@@ -1025,14 +1026,14 @@ class _AvailableNotesScreenState extends State<AvailableNotesScreen> {
                                   mainAxisSize: MainAxisSize.min,
                                   children: [
                                     Icon(
-                                      Icons.picture_as_pdf,
+                                      document.fileFormat.toLowerCase() == 'epub' ? Icons.auto_stories : Icons.picture_as_pdf,
                                       size: isTablet ? 25 : 20,
                                       color: Colors.white,
                                     ),
                                     SizedBox(width: isTablet ? 10 : 8),
                                     Flexible(
                                       child: Text(
-                                        'View PDF',
+                                        document.fileFormat.toLowerCase() == 'epub' ? 'Read EPUB' : 'View PDF',
                                         style: TextStyle(
                                           fontFamily: 'Poppins',
                                           fontSize: isTablet ? 17 : 14,
@@ -1111,10 +1112,11 @@ class _AvailableNotesScreenState extends State<AvailableNotesScreen> {
                                     child: ElevatedButton(
                                       onPressed: () {
                                         context.pushNamed(
-                                          'pdf-viewer',
+                                          document.fileFormat.toLowerCase() == 'epub' ? 'epub-viewer' : 'pdf-viewer',
                                           queryParameters: {
                                             'documentId': document.documentId,
                                             'title': document.title,
+                                            if (document.fileFormat.toLowerCase() == 'epub') 'source': 'document',
                                           },
                                         );
                                       },
@@ -1129,7 +1131,7 @@ class _AvailableNotesScreenState extends State<AvailableNotesScreen> {
                                       child: FittedBox(
                                         fit: BoxFit.scaleDown,
                                         child: Text(
-                                          'View PDF',
+                                          document.fileFormat.toLowerCase() == 'epub' ? 'Read EPUB' : 'View PDF',
                                           style: TextStyle(
                                             fontFamily: 'Poppins',
                                             fontSize: isTablet ? 14 : 11,
