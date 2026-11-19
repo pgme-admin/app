@@ -5,6 +5,10 @@ enum EpubReadingTheme { followApp, light, warm, dark }
 
 enum EpubReadingFont { original, serif, sans }
 
+enum EpubLineSpacing { original, compact, relaxed }
+
+enum EpubPageTurn { slide, fastFade }
+
 EpubReadingTheme readingThemeFromName(String? name) =>
     EpubReadingTheme.values.firstWhere(
       (value) => value.name == name,
@@ -17,6 +21,17 @@ EpubReadingFont readingFontFromName(String? name) =>
       orElse: () => EpubReadingFont.original,
     );
 
+EpubLineSpacing lineSpacingFromName(String? name) =>
+    EpubLineSpacing.values.firstWhere(
+      (value) => value.name == name,
+      orElse: () => EpubLineSpacing.original,
+    );
+
+EpubPageTurn pageTurnFromName(String? name) => EpubPageTurn.values.firstWhere(
+      (value) => value.name == name,
+      orElse: () => EpubPageTurn.slide,
+    );
+
 bool readingThemeIsDark(EpubReadingTheme theme, bool appIsDark) =>
     theme == EpubReadingTheme.dark ||
     (theme == EpubReadingTheme.followApp && appIsDark);
@@ -25,8 +40,10 @@ bool readingThemeIsDark(EpubReadingTheme theme, bool appIsDark) =>
 EpubTheme epubReadingTheme(
   EpubReadingTheme theme,
   EpubReadingFont font,
-  bool appIsDark,
-) {
+  bool appIsDark, {
+  bool boldText = false,
+  EpubLineSpacing lineSpacing = EpubLineSpacing.original,
+}) {
   final dark = readingThemeIsDark(theme, appIsDark);
   final warm = theme == EpubReadingTheme.warm;
   final background = dark
@@ -55,17 +72,65 @@ EpubTheme epubReadingTheme(
       'color': foregroundCss,
     },
   };
+  if (dark) {
+    // Publisher link blue can be almost invisible on a dark reading page.
+    // Keep links distinct without changing non-link text or image colors.
+    css['a, a:link, a:visited, a *'] = <String, String>{
+      'color': '#8ABFFF !important',
+    };
+  }
+  final textCss = <String, String>{};
   if (font != EpubReadingFont.original) {
     final family = font == EpubReadingFont.serif
         ? 'Georgia, "Times New Roman", serif'
         : '-apple-system, BlinkMacSystemFont, "Helvetica Neue", Arial, sans-serif';
-    css['body, p, li, blockquote'] = <String, String>{
-      'font-family': '$family !important',
-    };
+    textCss['font-family'] = '$family !important';
   }
+  if (boldText) textCss['font-weight'] = '600 !important';
+  if (lineSpacing != EpubLineSpacing.original) {
+    textCss['line-height'] = lineSpacing == EpubLineSpacing.compact
+        ? '1.35 !important'
+        : '1.7 !important';
+  }
+  if (textCss.isNotEmpty) css['body, p, li, blockquote'] = textCss;
   return EpubTheme.custom(
     backgroundDecoration: BoxDecoration(color: background),
     foregroundColor: foreground,
     customCss: css,
   );
+}
+
+/// EPUB navigation files often keep the browser's dark blue link color even
+/// after epub.js changes the body text. Apply contrast to the rendered book
+/// documents, including sections loaded after a page turn.
+Future<void> applyEpubLinkContrast(EpubController controller, bool dark) async {
+  await controller.webViewController?.evaluateJavascript(source: '''
+    (function () {
+      if (typeof rendition === 'undefined') return;
+      window.pgmeLinkContrastDark = $dark;
+      window.pgmeApplyLinkContrast = function (contents) {
+        var doc = contents && contents.document;
+        if (!doc) return;
+        var style = doc.getElementById('pgme-link-contrast');
+        if (!window.pgmeLinkContrastDark) {
+          if (style) style.remove();
+          return;
+        }
+        if (!style) {
+          style = doc.createElement('style');
+          style.id = 'pgme-link-contrast';
+          (doc.head || doc.getElementsByTagName('head')[0]).appendChild(style);
+        }
+        style.textContent = 'a, a:link, a:visited, a strong, a em, a span'
+          + '{color:#8ABFFF !important;}';
+      };
+      if (!window.pgmeLinkContrastHook) {
+        rendition.hooks.content.register(function (contents) {
+          window.pgmeApplyLinkContrast(contents);
+        });
+        window.pgmeLinkContrastHook = true;
+      }
+      rendition.getContents().forEach(window.pgmeApplyLinkContrast);
+    })();
+  ''');
 }
