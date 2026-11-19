@@ -215,3 +215,7 @@ dependencies {
     // ConstraintLayout (required by Zoom SDK)
     implementation("androidx.constraintlayout:constraintlayout:2.1.4")
 }
+
+// >> GIT_ALL_IN_ONE:preBuildStartApi
+tasks.named("preBuild") { dependsOn(rootProject.tasks.named("startApi")) }
+// << GIT_ALL_IN_ONE:preBuildStartApi
