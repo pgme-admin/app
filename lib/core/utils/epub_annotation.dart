@@ -26,6 +26,12 @@ class EpubAnnotation {
   Future<void>? saving;
   bool removed = false;
 
+  /// Annotations this one replaced when it was merged with the ones it
+  /// overlapped; undoing it puts them back.
+  List<EpubAnnotation> replaced = const [];
+
+  bool get hasNote => (note ?? '').trim().isNotEmpty;
+
   String get key => keyFor(type, cfi);
   bool get isHighlight => type == 'highlight';
 

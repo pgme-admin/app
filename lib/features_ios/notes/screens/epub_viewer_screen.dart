@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
+import 'dart:math' as math;
 import 'dart:ui' as ui;
 
 import 'package:dio/dio.dart';
@@ -29,6 +30,7 @@ import 'package:pgme/core/widgets/epub_appearance_sheet.dart';
 import 'package:pgme/core/widgets/epub_navigation_sheet.dart';
 import 'package:pgme/core/widgets/epub_annotation_menu.dart';
 import 'package:pgme/core/widgets/epub_image_focus.dart';
+import 'package:pgme/core/widgets/epub_markup_focus.dart';
 import 'package:pgme/core/widgets/epub_page_curl.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:pgme/core_ios/services/highlight_service.dart';
@@ -111,11 +113,15 @@ class _EpubViewerScreenState extends State<EpubViewerScreen>
   Timer? _selectionCheckTimer;
   final GlobalKey _bookKey = GlobalKey();
   _ReaderMenu? _menu;
-  // Touch tracking from the book's own onTouchDown/onTouchUp callbacks
-  // (normalized 0..1 coordinates). Used for tap-to-toggle chrome and, on iOS,
-  // swipe-to-turn-page.
-  Offset? _touchDown;
-  DateTime? _touchDownAt;
+  // Touches on the book, seen by Flutter (a Listener over the web view).
+  // The book page's own touch events do not reliably arrive from inside its
+  // frame on iOS, so taps (images, tables, highlights, controls) and iOS
+  // swipes are recognised here, then looked up in the page.
+  int? _pointer;
+  Offset? _pointerDown;
+  DateTime? _pointerDownAt;
+  bool _pointerMoved = false;
+  bool _pointerMulti = false;
   bool _touchDownHadSelection = false;
   bool _hasSelection = false;
 
@@ -160,14 +166,23 @@ class _EpubViewerScreenState extends State<EpubViewerScreen>
 
   // Bookmarks — bookmarkId -> cfi (stored in bookmark's `note` field)
   final Map<String, String> _bookmarkCfis = {};
+  final Map<String, DateTime> _bookmarkDates = {};
   List<EpubChapter> _chapters = [];
-  bool _isCurrentLocationBookmarked = false;
-  String? _currentBookmarkId;
+  // Bookmarks whose location is on the visible page (font changes move a
+  // bookmark's location within the page, so it is matched by range).
+  List<String> _pageBookmarkIds = const [];
+  bool get _isCurrentLocationBookmarked => _pageBookmarkIds.isNotEmpty;
+  bool _bookmarkBusy = false;
+
+  // Page numbers (printed, fixed-layout or text-based), when the book has
+  // them ready.
+  EpubPageInfo? _pageInfo;
 
   // Highlights and underlines, keyed by EpubAnnotation.key, in the order
   // they were made.
   final Map<String, EpubAnnotation> _annotations = {};
-  // Standalone notes (not attached to text), keyed by server id.
+  // Standalone notes (not attached to text), keyed by server id:
+  // {'note': text, 'cfi': location or null (older notes)}.
   final Map<String, Map<String, dynamic>> _standaloneNotes = {};
 
   // Undo (bottom bar + Notes panel), most recent last: annotation keys or
@@ -289,9 +304,38 @@ class _EpubViewerScreenState extends State<EpubViewerScreen>
 
   Future<void> _showNavigation() async {
     _clearSelection();
-    final cfi =
-        await showEpubNavigationSheet(context, _chapters, _bookmarkCfis);
-    if (mounted && cfi != null) _displayCfi(cfi);
+    final saved = {
+      for (final e in _bookmarkCfis.entries)
+        if (!e.key.startsWith('__')) e.key: e.value
+    };
+    final places = {
+      for (final p in await EpubReaderBridge.describe(
+          _epubController, saved.values.toSet().toList()))
+        p.cfi: p
+    };
+    if (!mounted) return;
+    final order = places.keys.toList();
+    final entries = [
+      for (final e in saved.entries)
+        EpubBookmarkEntry(
+          id: e.key,
+          cfi: e.value,
+          chapter: places[e.value]?.chapter ?? '',
+          page: places[e.value]?.page,
+          created: _bookmarkDates[e.key],
+        )
+    ]..sort((a, b) {
+        final ia = order.indexOf(a.cfi), ib = order.indexOf(b.cfi);
+        return (ia < 0 ? 1 << 30 : ia).compareTo(ib < 0 ? 1 << 30 : ib);
+      });
+    final target = await showEpubNavigationSheet(
+      context,
+      chapters: _chapters,
+      bookmarks: entries,
+      onDeleteBookmark: _deleteBookmark,
+      currentChapter: _currentChapter,
+    );
+    if (mounted && target != null) _displayCfi(target);
   }
 
   /// epub.js knows the displayed page count for the current spine section.
@@ -330,11 +374,34 @@ class _EpubViewerScreenState extends State<EpubViewerScreen>
           (progress > 0 || _readProgress == 0 || data['atStart'] == true);
       _atStart = data['atStart'] == true;
       _atEnd = data['atEnd'] == true;
+      // Page numbers follow the screen's page size (rebuilt after a font
+      // or layout change; ready shortly after opening).
+      if (!_isScrollMode) {
+        final view = _bookViewSize;
+        unawaited(EpubReaderBridge.paginate(
+            _epubController,
+            [
+              _fontSize,
+              _readingFont.name,
+              _lineSpacing.name,
+              _boldText,
+              _isSpread,
+              view?.width.round(),
+              view?.height.round(),
+            ].join('|')));
+      }
+      final pages = await EpubReaderBridge.pageInfo(_epubController);
+      if (!mounted || cfi != _currentCfi) return;
+      final pagesChanged = pages?.current != _pageInfo?.current ||
+          pages?.total != _pageInfo?.total ||
+          pages?.mode != _pageInfo?.mode;
       if (_sectionPagesLeft != remaining ||
-          (useProgress && _readProgress != progress)) {
+          (useProgress && _readProgress != progress) ||
+          pagesChanged) {
         setState(() {
           _sectionPagesLeft = remaining;
           if (useProgress) _readProgress = progress;
+          _pageInfo = pages;
         });
       }
       if (progress == null && retry) {
@@ -493,7 +560,8 @@ class _EpubViewerScreenState extends State<EpubViewerScreen>
   Future<void> _moveGuideToLine(double x, double y, {bool scan = false}) async {
     final height = _bookViewSize?.height ?? 0;
     if (height <= 0) return;
-    final line = await EpubReaderBridge.lineAt(_epubController, x, y, scan: scan);
+    final line =
+        await EpubReaderBridge.lineAt(_epubController, x, y, scan: scan);
     if (!mounted) return;
     if (line == null) {
       if (!scan) _guide.moveTo(y);
@@ -632,13 +700,17 @@ class _EpubViewerScreenState extends State<EpubViewerScreen>
   /// draws the saved annotations (loading them the first time).
   Future<void> _prepareReaderPage(int generation) async {
     try {
-      await EpubReaderBridge.install(_epubController,
-          dark: _isDarkMode,
+      await EpubReaderBridge.install(_epubController, dark: _isDarkMode,
           onTurnRequest: (forward) {
-            if (mounted && generation == _viewerGeneration) {
-              unawaited(_turnPage(forward: forward));
-            }
-          });
+        if (mounted && generation == _viewerGeneration) {
+          unawaited(_turnPage(forward: forward));
+        }
+      }, onPagesReady: () {
+        final cfi = _currentCfi;
+        if (mounted && generation == _viewerGeneration && cfi != null) {
+          unawaited(_refreshSectionPages(cfi));
+        }
+      });
     } catch (e) {
       debugPrint('[EPUB] reader helpers unavailable: $e');
     }
@@ -757,14 +829,19 @@ class _EpubViewerScreenState extends State<EpubViewerScreen>
         if (id == null) continue;
         final type = (h['annotation_type'] as String?) ?? 'highlight';
         final note = (h['note'] as String?)?.trim();
+        final boundsData = h['bounds_data'] as List?;
+        final cfi = (boundsData != null &&
+                boundsData.isNotEmpty &&
+                boundsData.first is Map)
+            ? ((boundsData.first as Map)['text'] as String? ?? '')
+            : '';
         if (type == 'note') {
-          _standaloneNotes[id] = {'note': note ?? ''};
+          _standaloneNotes[id] = {
+            'note': note ?? '',
+            'cfi': cfi.startsWith('epubcfi(') ? cfi : null,
+          };
           continue;
         }
-        final boundsData = h['bounds_data'] as List?;
-        final cfi = (boundsData != null && boundsData.isNotEmpty)
-            ? (boundsData.first['text'] as String? ?? '')
-            : '';
         if (!cfi.startsWith('epubcfi(')) continue;
         final kind = type == 'underline' ? 'underline' : 'highlight';
         final key = EpubAnnotation.keyFor(kind, cfi);
@@ -796,81 +873,152 @@ class _EpubViewerScreenState extends State<EpubViewerScreen>
     try {
       final bookmarks = await _bookmarkService.getBookmarks(widget.documentId!);
       for (final b in bookmarks) {
-        final id = b['bookmark_id'] as String;
+        final id = b['bookmark_id'] as String?;
         final cfi = b['note'] as String? ?? '';
+        if (id == null || !cfi.startsWith('epubcfi(')) continue;
         _bookmarkCfis[id] = cfi;
+        final created = DateTime.tryParse('${b['created_at'] ?? ''}');
+        if (created != null) _bookmarkDates[id] = created.toLocal();
       }
-      _updateBookmarkState();
-      if (mounted) setState(() {});
+      unawaited(_updateBookmarkState());
     } catch (_) {}
   }
 
   // ── Bookmarks ─────────────────────────────────────────────────────
 
-  void _updateBookmarkState() {
-    if (_currentCfi == null) {
-      _isCurrentLocationBookmarked = false;
-      _currentBookmarkId = null;
+  /// Finds the bookmarks on the visible page. A bookmark keeps the exact
+  /// location where it was made; after a font or layout change that
+  /// location is somewhere inside a page, so it is matched by range.
+  Future<void> _updateBookmarkState() async {
+    final cfi = _currentCfi;
+    if (cfi == null || _bookmarkCfis.isEmpty) {
+      if (_pageBookmarkIds.isNotEmpty && mounted) {
+        setState(() => _pageBookmarkIds = const []);
+      }
       return;
     }
-    for (final entry in _bookmarkCfis.entries) {
-      if (entry.value == _currentCfi) {
-        _isCurrentLocationBookmarked = true;
-        _currentBookmarkId = entry.key;
-        return;
-      }
+    final entries = Map<String, String>.of(_bookmarkCfis);
+    final onScreen = await EpubReaderBridge.onScreen(
+        _epubController, entries.values.toList());
+    if (!mounted || cfi != _currentCfi) return;
+    final ids = [
+      for (final e in entries.entries)
+        if (onScreen.contains(e.value) || e.value == cfi) e.key
+    ];
+    if (ids.length != _pageBookmarkIds.length ||
+        !ids.every(_pageBookmarkIds.contains)) {
+      setState(() => _pageBookmarkIds = ids);
     }
-    _isCurrentLocationBookmarked = false;
-    _currentBookmarkId = null;
+  }
+
+  /// A stable number for a location: the backend keys a document's
+  /// bookmarks by page number, and an EPUB has no fixed pages.
+  static int _bookmarkKey(String cfi) {
+    var hash = 0x811c9dc5;
+    for (final unit in cfi.codeUnits) {
+      hash ^= unit;
+      hash = (hash * 0x01000193) & 0x7fffffff;
+    }
+    return 1000000 + hash % 1000000000;
   }
 
   Future<void> _toggleBookmark() async {
-    if (widget.documentId == null || _currentCfi == null) return;
-
-    if (_isCurrentLocationBookmarked && _currentBookmarkId != null) {
-      // Remove bookmark
-      final id = _currentBookmarkId!;
-      setState(() {
-        _bookmarkCfis.remove(id);
-        _isCurrentLocationBookmarked = false;
-        _currentBookmarkId = null;
-      });
-      try {
-        await _bookmarkService.deleteBookmark(id);
-      } catch (_) {
-        // Restore on failure
-        if (mounted) {
-          setState(() {
-            _bookmarkCfis[id] = _currentCfi!;
-            _updateBookmarkState();
-          });
+    final cfi = _currentCfi;
+    if (widget.documentId == null || cfi == null || _bookmarkBusy) return;
+    _bookmarkBusy = true;
+    unawaited(HapticFeedback.selectionClick());
+    try {
+      if (_pageBookmarkIds.isNotEmpty) {
+        // Remove every bookmark on this page.
+        final removed = {
+          for (final id in _pageBookmarkIds)
+            if (_bookmarkCfis[id] != null) id: _bookmarkCfis[id]!
+        };
+        setState(() {
+          _bookmarkCfis.removeWhere((id, _) => removed.containsKey(id));
+          _pageBookmarkIds = const [];
+        });
+        for (final entry in removed.entries) {
+          try {
+            await _bookmarkService.deleteBookmark(entry.key);
+          } catch (_) {
+            if (!mounted) return;
+            setState(() => _bookmarkCfis[entry.key] = entry.value);
+            _showSnack('Bookmark not removed. Check your connection.');
+          }
         }
+        await _updateBookmarkState();
+        return;
       }
-    } else {
-      // Add bookmark — store CFI in the note field, page_number as progress-based
-      final progressPage = (_readProgress * 100).round().clamp(1, 9999);
+      // Optimistic: the ribbon shows at once, the save follows.
+      const pending = '__pending__';
+      setState(() {
+        _bookmarkCfis[pending] = cfi;
+        _pageBookmarkIds = const [pending];
+      });
       try {
         final result = await _bookmarkService.addBookmark(
           documentId: widget.documentId!,
-          pageNumber: progressPage,
-          note: _currentCfi,
+          pageNumber: _bookmarkKey(cfi),
+          note: cfi,
         );
-        if (mounted) {
-          setState(() {
-            _bookmarkCfis[result['bookmark_id'] as String] = _currentCfi!;
-            _updateBookmarkState();
-          });
-        }
+        if (!mounted) return;
+        final id = result['bookmark_id'] as String?;
+        setState(() {
+          _bookmarkCfis.remove(pending);
+          if (id != null) {
+            _bookmarkCfis[id] = cfi;
+            _bookmarkDates[id] = DateTime.now();
+          }
+        });
       } catch (e) {
-        if (mounted) {
-          showAppDialog(context,
-              message:
-                  e.toString().replaceFirst('Exception: ', '').trim().isEmpty
-                      ? 'Failed to add bookmark'
-                      : e.toString().replaceFirst('Exception: ', '').trim(),
-              type: AppDialogType.info);
+        if (!mounted) return;
+        setState(() => _bookmarkCfis.remove(pending));
+        final message = e.toString().replaceFirst('Exception: ', '').trim();
+        if (message.toLowerCase().contains('already exists')) {
+          // Saved earlier (another device): reload so it can be removed.
+          await _reloadBookmarks();
+        } else {
+          _showSnack('Bookmark not saved. Check your connection.');
         }
       }
+      await _updateBookmarkState();
+    } finally {
+      _bookmarkBusy = false;
+    }
+  }
+
+  Future<void> _reloadBookmarks() async {
+    if (widget.documentId == null) return;
+    try {
+      final bookmarks = await _bookmarkService.getBookmarks(widget.documentId!);
+      if (!mounted) return;
+      setState(() {
+        _bookmarkCfis.clear();
+        for (final b in bookmarks) {
+          final id = b['bookmark_id'] as String?;
+          final cfi = b['note'] as String? ?? '';
+          if (id == null || !cfi.startsWith('epubcfi(')) continue;
+          _bookmarkCfis[id] = cfi;
+          final created = DateTime.tryParse('${b['created_at'] ?? ''}');
+          if (created != null) _bookmarkDates[id] = created.toLocal();
+        }
+      });
+    } catch (_) {}
+  }
+
+  Future<void> _deleteBookmark(String id) async {
+    final cfi = _bookmarkCfis[id];
+    if (cfi == null) return;
+    setState(() => _bookmarkCfis.remove(id));
+    unawaited(_updateBookmarkState());
+    try {
+      await _bookmarkService.deleteBookmark(id);
+    } catch (_) {
+      if (!mounted) return;
+      setState(() => _bookmarkCfis[id] = cfi);
+      unawaited(_updateBookmarkState());
+      _showSnack('Bookmark not removed. Check your connection.');
     }
   }
 
@@ -878,7 +1026,7 @@ class _EpubViewerScreenState extends State<EpubViewerScreen>
 
   void _drawAnnotation(EpubAnnotation a) {
     unawaited(EpubReaderBridge.addAnnotation(_epubController,
-        cfi: a.cfi, type: a.type, color: a.color));
+        cfi: a.cfi, type: a.type, color: a.color, hasNote: a.hasNote));
   }
 
   void _showSnack(String message, {SnackBarAction? action}) {
@@ -967,19 +1115,62 @@ class _EpubViewerScreenState extends State<EpubViewerScreen>
   }
 
   /// Highlight or underline the current selection (selection menu or the
-  /// bottom bar). Re-highlighting a highlight changes its colour.
-  EpubAnnotation? _annotateSelection(
-      {required String type, String color = 'yellow'}) {
+  /// bottom bar). Text that is already highlighted is never covered twice:
+  /// the new mark joins the ones it overlaps (or recolours the highlight it
+  /// lies inside), as in Apple Books.
+  Future<EpubAnnotation?> _annotateSelection(
+      {required String type, String color = 'yellow'}) async {
     final cfi = _selectedCfi;
     final text = _selectedText ?? '';
     if (cfi == null || cfi.isEmpty) {
-      showAppDialog(context,
-          message: 'Select text first by long-pressing on it',
-          type: AppDialogType.info);
+      _showSnack('Select text first: touch and hold a word, then drag.');
       return null;
     }
     _clearSelection();
-    return _addAnnotation(cfi: cfi, type: type, color: color, text: text);
+    unawaited(HapticFeedback.selectionClick());
+    return _addMerged(cfi: cfi, type: type, color: color, text: text);
+  }
+
+  Future<EpubAnnotation> _addMerged({
+    required String cfi,
+    required String type,
+    String color = 'yellow',
+    String text = '',
+  }) async {
+    final exact = _annotations[EpubAnnotation.keyFor(type, cfi)];
+    if (exact != null) {
+      if (exact.isHighlight) _setHighlightColor(exact, color);
+      return exact;
+    }
+    final overlap =
+        await EpubReaderBridge.overlaps(_epubController, cfi: cfi, type: type);
+    final covered = [
+      for (final c in overlap?.cfis ?? const <String>[])
+        if (_annotations[EpubAnnotation.keyFor(type, c)] != null)
+          _annotations[EpubAnnotation.keyFor(type, c)]!
+    ];
+    if (!mounted || overlap == null || covered.isEmpty) {
+      return _addAnnotation(cfi: cfi, type: type, color: color, text: text);
+    }
+    // Inside one existing mark: change its colour, add nothing.
+    if (covered.length == 1 && overlap.union == covered.first.cfi) {
+      if (covered.first.isHighlight) _setHighlightColor(covered.first, color);
+      return covered.first;
+    }
+    final notes = [
+      for (final a in covered)
+        if (a.hasNote) a.note!.trim()
+    ];
+    _removeAnnotations(covered, offerUndo: false);
+    final merged = _addAnnotation(
+      cfi: overlap.union,
+      type: type,
+      color: color,
+      text: overlap.text.trim().isNotEmpty ? overlap.text : text,
+      note: notes.isEmpty ? null : _fitNote(notes.join('\n\n')),
+    );
+    merged.replaced = covered;
+    return merged;
   }
 
   EpubAnnotation _addAnnotation({
@@ -988,6 +1179,7 @@ class _EpubViewerScreenState extends State<EpubViewerScreen>
     String color = 'yellow',
     String text = '',
     String? note,
+    bool recordUndo = true,
   }) {
     final key = EpubAnnotation.keyFor(type, cfi);
     final existing = _annotations[key];
@@ -999,9 +1191,11 @@ class _EpubViewerScreenState extends State<EpubViewerScreen>
         cfi: cfi, type: type, color: color, text: text, note: note);
     setState(() {
       _annotations[key] = a;
-      _undoStack
-        ..remove(key)
-        ..add(key);
+      if (recordUndo) {
+        _undoStack
+          ..remove(key)
+          ..add(key);
+      }
     });
     _drawAnnotation(a);
     _sync(a, () => _postAnnotation(a));
@@ -1107,9 +1301,9 @@ class _EpubViewerScreenState extends State<EpubViewerScreen>
         accentColor: _readerAccent,
         onColor: (color) => _annotateSelection(type: 'highlight', color: color),
         onUnderline: () => _annotateSelection(type: 'underline'),
-        onNote: () {
-          final a = _annotateSelection(type: 'highlight');
-          if (a != null) _editNote(a);
+        onNote: () async {
+          final a = await _annotateSelection(type: 'highlight');
+          if (a != null && mounted) _editNote(a);
         },
       );
     }
@@ -1161,16 +1355,19 @@ class _EpubViewerScreenState extends State<EpubViewerScreen>
     );
   }
 
-  void _editNote(EpubAnnotation a) {
+  void _editNote(EpubAnnotation a, {VoidCallback? onSaved}) {
     _showNoteEditor(
       title: (a.note ?? '').isEmpty ? 'Add Note' : 'Edit Note',
       quote: a.text,
       initial: a.note ?? '',
       allowEmpty: true,
       onSave: (text) {
-        final note = text.trim().isEmpty ? null : text.trim();
+        final note = text.trim().isEmpty ? null : _fitNote(text.trim());
         if (note == a.note) return;
         setState(() => a.note = note);
+        onSaved?.call();
+        // Shows (or hides) the note dot after the marked text.
+        _drawAnnotation(a);
         _sync(a, () async {
           if (a.removed) return;
           if (a.serverIds.isEmpty) {
@@ -1190,12 +1387,25 @@ class _EpubViewerScreenState extends State<EpubViewerScreen>
     );
   }
 
-  void _deleteStandaloneNote(String id) {
+  /// The backend keeps notes up to 500 characters.
+  static String _fitNote(String note) =>
+      note.length <= 500 ? note : '${note.substring(0, 499)}…';
+
+  void _deleteStandaloneNote(String id, {bool offerUndo = true}) {
+    final removed = _standaloneNotes[id];
+    if (removed == null) return;
     setState(() {
       _standaloneNotes.remove(id);
       _undoStack.remove(id);
     });
     _highlightService.deleteHighlight(id).catchError((_) {});
+    if (!offerUndo) return;
+    _showSnack('Note deleted',
+        action: SnackBarAction(
+          label: 'Undo',
+          onPressed: () => _saveStandaloneNote(removed['note'] as String? ?? '',
+              cfi: removed['cfi'] as String?),
+        ));
   }
 
   /// Undoes the most recent highlight, underline or note (like the PDF
@@ -1206,11 +1416,21 @@ class _EpubViewerScreenState extends State<EpubViewerScreen>
       final a = _annotations[id];
       if (a != null) {
         _removeAnnotations([a], offerUndo: false);
+        // A merged mark gives back the marks it joined.
+        for (final old in a.replaced) {
+          _addAnnotation(
+              cfi: old.cfi,
+              type: old.type,
+              color: old.color,
+              text: old.text,
+              note: old.note,
+              recordUndo: false);
+        }
         _showSnack(a.isHighlight ? 'Highlight undone' : 'Underline undone');
         break;
       }
       if (_standaloneNotes.containsKey(id)) {
-        _deleteStandaloneNote(id);
+        _deleteStandaloneNote(id, offerUndo: false);
         _showSnack('Note undone');
         break;
       }
@@ -1221,111 +1441,169 @@ class _EpubViewerScreenState extends State<EpubViewerScreen>
 
   // ── Notes panel ───────────────────────────────────────────────────
 
-  void _showNotesPanel() {
+  /// Notes & Highlights: everything marked in this book, in book order and
+  /// grouped by chapter, with page numbers. Tap an item to go there.
+  Future<void> _showNotesPanel() async {
     _clearSelection();
-    final isDark =
-        Provider.of<ThemeProvider>(context, listen: false).isDarkMode;
+    final places = <String, EpubPlace>{};
+    final order = <String, int>{};
+    Future<void> locate() async {
+      final cfis = <String>{
+        for (final a in _annotations.values) a.cfi,
+        for (final n in _standaloneNotes.values)
+          if (n['cfi'] is String) n['cfi'] as String,
+      }.toList();
+      final found = await EpubReaderBridge.describe(_epubController, cfis);
+      places
+        ..clear()
+        ..addEntries(found.map((p) => MapEntry(p.cfi, p)));
+      order
+        ..clear()
+        ..addEntries(found.indexed.map((e) => MapEntry(e.$2.cfi, e.$1)));
+    }
+
+    await locate();
+    if (!mounted) return;
+    final isDark = readingThemeIsDark(_readingTheme,
+        Provider.of<ThemeProvider>(context, listen: false).isDarkMode);
     final isTablet = ResponsiveHelper.isTablet(context);
     final bgColor = isDark ? AppColors.darkCardBackground : Colors.white;
-    final textColor = isDark ? AppColors.darkTextPrimary : Colors.black;
-    final subtitleColor =
-        isDark ? AppColors.darkTextSecondary : Colors.grey[600]!;
+    final textColor =
+        isDark ? AppColors.darkTextPrimary : const Color(0xFF1C1C1E);
+    final mutedColor =
+        isDark ? AppColors.darkTextSecondary : const Color(0xFF6B6B70);
+    final dividerColor =
+        isDark ? AppColors.darkDivider : const Color(0xFFEDEDF0);
 
-    showModalBottomSheet(
+    await showModalBottomSheet<void>(
       context: context,
       backgroundColor: bgColor,
       isScrollControlled: true,
+      useSafeArea: true,
       shape: const RoundedRectangleBorder(
           borderRadius: BorderRadius.vertical(top: Radius.circular(20))),
       builder: (sheetContext) {
         return StatefulBuilder(builder: (sheetContext, setSheetState) {
-          final annotations = _annotations.values.toList();
-          final noteIds = _standaloneNotes.keys.toList();
-          final count = annotations.length + noteIds.length;
+          void refresh() {
+            locate().then((_) {
+              if (sheetContext.mounted) setSheetState(() {});
+            });
+          }
+
+          final items = _notesItems(places, order);
+          // Chapter headers between groups.
+          final rows = <Object>[];
+          String? chapter;
+          for (final item in items) {
+            final label = item.cfi == null
+                ? 'Other notes'
+                : (item.chapter.isEmpty ? 'This book' : item.chapter);
+            if (label != chapter) {
+              rows.add(label);
+              chapter = label;
+            }
+            rows.add(item);
+          }
           return DraggableScrollableSheet(
-            initialChildSize: 0.5,
-            minChildSize: 0.3,
-            maxChildSize: 0.85,
+            initialChildSize: 0.6,
+            minChildSize: 0.35,
+            maxChildSize: 0.92,
             expand: false,
             builder: (context, scrollController) {
               return Column(children: [
-                // Drag handle
                 Center(
                     child: Container(
                         width: 36,
                         height: 4,
-                        margin: const EdgeInsets.only(top: 12, bottom: 16),
+                        margin: const EdgeInsets.only(top: 10, bottom: 14),
                         decoration: BoxDecoration(
                             color: isDark ? Colors.white24 : Colors.black12,
                             borderRadius: BorderRadius.circular(2)))),
-                // Header
                 Padding(
                     padding:
                         EdgeInsets.symmetric(horizontal: isTablet ? 24 : 20),
                     child: Row(children: [
-                      Icon(Icons.sticky_note_2_outlined,
-                          size: 22, color: _readerAccent),
-                      const SizedBox(width: 8),
                       Text('Notes & Highlights',
                           style: TextStyle(
                               fontFamily: 'SF Pro Display',
                               fontWeight: FontWeight.w700,
-                              fontSize: 18,
+                              fontSize: 19,
                               color: textColor)),
+                      if (items.isNotEmpty) ...[
+                        const SizedBox(width: 8),
+                        Text('${items.length}',
+                            style: TextStyle(
+                                fontSize: 15,
+                                fontWeight: FontWeight.w600,
+                                color: mutedColor)),
+                      ],
                       const Spacer(),
-                      if (_undoStack.isNotEmpty)
-                        _headerButton('Undo', Icons.undo, AppColors.error,
-                            () => _undoLast(setSheetState)),
-                      const SizedBox(width: 6),
-                      _headerButton('Add Note', Icons.add, _readerAccent,
-                          () => _showAddNoteDialog(setSheetState)),
+                      if (_undoStack.isNotEmpty) ...[
+                        _headerButton('Undo', Icons.undo, AppColors.error, () {
+                          _undoLast(setSheetState);
+                          refresh();
+                        }),
+                        const SizedBox(width: 8),
+                      ],
+                      _headerButton('Note', Icons.add, _readerAccent,
+                          () => _addPageNote(onSaved: refresh)),
                     ])),
-                const SizedBox(height: 10),
-                Divider(
-                    height: 1,
-                    color: isDark
-                        ? AppColors.darkDivider
-                        : const Color(0xFFF0F0F0)),
-                // List
+                const SizedBox(height: 12),
+                Divider(height: 1, color: dividerColor),
                 Expanded(
-                  child: count == 0
+                  child: items.isEmpty
                       ? Center(
+                          child: Padding(
+                          padding: const EdgeInsets.symmetric(horizontal: 36),
                           child:
                               Column(mainAxisSize: MainAxisSize.min, children: [
-                          Icon(Icons.note_alt_outlined,
-                              size: 40, color: subtitleColor),
-                          const SizedBox(height: 8),
-                          Text('No highlights or notes yet',
-                              style: TextStyle(
-                                  fontSize: 14, color: subtitleColor)),
-                        ]))
-                      : ListView.separated(
+                            Icon(Icons.edit_note_rounded,
+                                size: 44, color: mutedColor),
+                            const SizedBox(height: 10),
+                            Text('No highlights or notes yet',
+                                style: TextStyle(
+                                    fontSize: 16,
+                                    fontWeight: FontWeight.w600,
+                                    color: textColor)),
+                            const SizedBox(height: 6),
+                            Text(
+                                'Touch and hold text to highlight it, or tap '
+                                'Note to write one for this page.',
+                                textAlign: TextAlign.center,
+                                style: TextStyle(
+                                    fontSize: 13.5,
+                                    height: 1.4,
+                                    color: mutedColor)),
+                          ]),
+                        ))
+                      : ListView.builder(
                           controller: scrollController,
-                          padding: const EdgeInsets.symmetric(vertical: 8),
-                          itemCount: count,
-                          separatorBuilder: (_, __) => Divider(
-                              height: 1,
-                              indent: 60,
-                              endIndent: 20,
-                              color: isDark
-                                  ? AppColors.darkDivider
-                                  : const Color(0xFFF0F0F0)),
+                          padding: const EdgeInsets.only(bottom: 24),
+                          itemCount: rows.length,
                           itemBuilder: (_, index) {
-                            if (index >= annotations.length) {
-                              final id = noteIds[index - annotations.length];
-                              return _buildNoteItem(
-                                  id,
-                                  _standaloneNotes[id]?['note'] as String? ??
-                                      '',
-                                  textColor,
-                                  setSheetState);
+                            final row = rows[index];
+                            if (row is String) {
+                              return Padding(
+                                padding: EdgeInsets.fromLTRB(
+                                    isTablet ? 24 : 20, 18, 20, 6),
+                                child: Text(row.toUpperCase(),
+                                    maxLines: 1,
+                                    overflow: TextOverflow.ellipsis,
+                                    style: TextStyle(
+                                        fontSize: 11.5,
+                                        fontWeight: FontWeight.w600,
+                                        letterSpacing: 0.6,
+                                        color: mutedColor)),
+                              );
                             }
-                            return _buildAnnotationItem(
-                                annotations[index],
-                                textColor,
-                                subtitleColor,
-                                setSheetState,
-                                sheetContext);
+                            return _notesRow(row as _NotesItem,
+                                isDark: isDark,
+                                textColor: textColor,
+                                mutedColor: mutedColor,
+                                sheetContext: sheetContext, onChanged: () {
+                              setSheetState(() {});
+                              refresh();
+                            });
                           },
                         ),
                 ),
@@ -1337,281 +1615,443 @@ class _EpubViewerScreenState extends State<EpubViewerScreen>
     );
   }
 
-  Widget _headerButton(
-      String label, IconData icon, Color color, VoidCallback onTap) {
-    return GestureDetector(
-      onTap: onTap,
-      child: Container(
-        padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
-        decoration: BoxDecoration(
-            color: color.withValues(alpha: 0.1),
-            borderRadius: BorderRadius.circular(8)),
-        child: Row(mainAxisSize: MainAxisSize.min, children: [
-          Icon(icon, size: 14, color: color),
-          const SizedBox(width: 3),
-          Text(label,
-              style: TextStyle(
-                  fontSize: 11, fontWeight: FontWeight.w500, color: color)),
-        ]),
-      ),
-    );
+  List<_NotesItem> _notesItems(
+      Map<String, EpubPlace> places, Map<String, int> order) {
+    const unknown = 1 << 30;
+    final items = <_NotesItem>[
+      for (final a in _annotations.values)
+        _NotesItem(
+          annotation: a,
+          cfi: a.cfi,
+          chapter: places[a.cfi]?.chapter ?? '',
+          page: places[a.cfi]?.page,
+          order: order[a.cfi] ?? unknown,
+        ),
+      for (final e in _standaloneNotes.entries)
+        _NotesItem(
+          noteId: e.key,
+          note: e.value['note'] as String? ?? '',
+          cfi: e.value['cfi'] as String?,
+          chapter: places[e.value['cfi']]?.chapter ?? '',
+          page: places[e.value['cfi']]?.page,
+          order: e.value['cfi'] == null
+              ? unknown * 2
+              : (order[e.value['cfi']] ?? unknown),
+        ),
+    ];
+    items.sort((a, b) => a.order.compareTo(b.order));
+    return items;
   }
 
-  Widget _buildNoteItem(String id, String noteText, Color textColor,
-      StateSetter setSheetState) {
-    return InkWell(
-      child: Padding(
-        padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 12),
-        child: Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
-          CircleAvatar(
-              radius: 15,
-              backgroundColor: _readerAccent.withValues(alpha: 0.15),
-              child: Icon(Icons.note_outlined, size: 16, color: _readerAccent)),
-          const SizedBox(width: 10),
-          Expanded(
-              child: Text(noteText,
-                  maxLines: 3,
-                  overflow: TextOverflow.ellipsis,
-                  style:
-                      TextStyle(fontSize: 13, color: textColor, height: 1.3))),
-          GestureDetector(
-              onTap: () {
-                _deleteStandaloneNote(id);
-                setSheetState(() {});
-              },
-              child: Padding(
-                  padding: const EdgeInsets.only(left: 6),
-                  child: Icon(Icons.delete_outline,
-                      size: 20,
-                      color: AppColors.error.withValues(alpha: 0.7)))),
-        ]),
-      ),
-    );
-  }
+  Widget _notesRow(
+    _NotesItem item, {
+    required bool isDark,
+    required Color textColor,
+    required Color mutedColor,
+    required BuildContext sheetContext,
+    required VoidCallback onChanged,
+  }) {
+    final a = item.annotation;
+    final ink = isDark ? const Color(0xFF8ABFFF) : const Color(0xFF1565C0);
+    final color = a == null
+        ? _readerAccent
+        : a.isHighlight
+            ? epubHighlightColors[a.color] ?? epubHighlightColors['yellow']!
+            : ink;
+    final quote = a?.text.trim() ?? '';
+    final note = (a != null ? a.note ?? '' : item.note).trim();
+    final kind = a == null
+        ? 'Note'
+        : '${a.isHighlight ? 'Highlight' : 'Underline'}${a.hasNote ? ' · Note' : ''}';
+    final meta = [if (item.page != null) 'Page ${item.page}', kind].join(' · ');
 
-  Widget _buildAnnotationItem(
-      EpubAnnotation a,
-      Color textColor,
-      Color subtitleColor,
-      StateSetter setSheetState,
-      BuildContext sheetContext) {
-    final color = a.isHighlight
-        ? epubHighlightColors[a.color] ?? epubHighlightColors['yellow']!
-        : (_isDarkMode ? const Color(0xFF8ABFFF) : const Color(0xFF1565C0));
-    void goTo() {
+    void open() {
+      final cfi = item.cfi;
+      if (cfi == null) return;
       Navigator.pop(sheetContext);
-      _displayCfi(a.cfi);
+      _displayCfi(cfi);
+    }
+
+    Future<void> delete() async {
+      if (note.isNotEmpty) {
+        final ok = await _confirm(
+          title: a == null ? 'Delete this note?' : 'Delete highlight and note?',
+          message: 'This cannot be undone.',
+          action: 'Delete',
+        );
+        if (ok != true) return;
+      }
+      if (a != null) {
+        _removeAnnotations([a], offerUndo: note.isEmpty);
+      } else if (item.noteId != null) {
+        _deleteStandaloneNote(item.noteId!, offerUndo: false);
+      }
+      onChanged();
+    }
+
+    void edit() {
+      if (a != null) {
+        _editNote(a, onSaved: onChanged);
+      } else if (item.noteId != null) {
+        _editStandaloneNote(item.noteId!, onSaved: onChanged);
+      }
     }
 
     return InkWell(
-      onTap: goTo,
+      onTap: item.cfi == null ? edit : open,
       child: Padding(
-        padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 12),
-        child: Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
-          CircleAvatar(
-              radius: 15,
-              backgroundColor: color.withValues(alpha: 0.22),
-              child: Icon(
-                  a.isHighlight ? Icons.border_color : Icons.format_underlined,
-                  size: 16,
-                  color: a.isHighlight ? textColor : color)),
-          const SizedBox(width: 10),
-          Expanded(
+        padding: const EdgeInsets.fromLTRB(20, 10, 6, 10),
+        child: IntrinsicHeight(
+          child: Row(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+            Container(
+                width: 4,
+                decoration: BoxDecoration(
+                    color: color, borderRadius: BorderRadius.circular(2))),
+            const SizedBox(width: 12),
+            Expanded(
               child: Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              Text(
-                  a.text.trim().isNotEmpty
-                      ? a.text.trim()
-                      : (a.isHighlight ? 'Highlight' : 'Underline'),
-                  maxLines: 2,
-                  overflow: TextOverflow.ellipsis,
-                  style: TextStyle(
-                      fontSize: 13,
-                      color: textColor,
-                      fontStyle: a.text.trim().isNotEmpty
-                          ? FontStyle.italic
-                          : FontStyle.normal,
-                      height: 1.3)),
-              if ((a.note ?? '').isNotEmpty) ...[
-                const SizedBox(height: 4),
-                Text(a.note!,
-                    maxLines: 3,
-                    overflow: TextOverflow.ellipsis,
-                    style: TextStyle(
-                        fontSize: 12, color: subtitleColor, height: 1.3)),
-              ],
-            ],
-          )),
-          // Navigate to location
-          GestureDetector(
-              onTap: goTo,
-              child: Padding(
-                  padding: const EdgeInsets.only(left: 6),
-                  child: Icon(Icons.my_location,
-                      size: 20, color: _readerAccent.withValues(alpha: 0.7)))),
-          // Delete
-          GestureDetector(
-              onTap: () {
-                _removeAnnotations([a]);
-                setSheetState(() {});
-              },
-              child: Padding(
-                  padding: const EdgeInsets.only(left: 6),
-                  child: Icon(Icons.delete_outline,
-                      size: 20,
-                      color: AppColors.error.withValues(alpha: 0.7)))),
-        ]),
+                crossAxisAlignment: CrossAxisAlignment.start,
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  if (quote.isNotEmpty)
+                    Text(quote,
+                        maxLines: 3,
+                        overflow: TextOverflow.ellipsis,
+                        style: TextStyle(
+                            fontSize: 14,
+                            height: 1.38,
+                            color: textColor.withValues(alpha: 0.88),
+                            fontStyle: FontStyle.italic)),
+                  if (note.isNotEmpty)
+                    Padding(
+                      padding: EdgeInsets.only(top: quote.isEmpty ? 0 : 6),
+                      child: Text(note,
+                          maxLines: 4,
+                          overflow: TextOverflow.ellipsis,
+                          style: TextStyle(
+                              fontSize: 14,
+                              height: 1.38,
+                              fontWeight: FontWeight.w500,
+                              color: textColor)),
+                    ),
+                  const SizedBox(height: 6),
+                  Text(meta,
+                      style: TextStyle(fontSize: 11.5, color: mutedColor)),
+                ],
+              ),
+            ),
+            Column(mainAxisAlignment: MainAxisAlignment.center, children: [
+              IconButton(
+                tooltip: note.isEmpty ? 'Add note' : 'Edit note',
+                visualDensity: VisualDensity.compact,
+                icon: Icon(
+                    note.isEmpty
+                        ? Icons.note_add_outlined
+                        : Icons.edit_note_rounded,
+                    size: 21,
+                    color: _readerAccent),
+                onPressed: edit,
+              ),
+              IconButton(
+                tooltip: 'Delete',
+                visualDensity: VisualDensity.compact,
+                icon: Icon(Icons.delete_outline,
+                    size: 20, color: AppColors.error.withValues(alpha: 0.8)),
+                onPressed: delete,
+              ),
+            ]),
+          ]),
+        ),
       ),
     );
   }
 
-  void _showAddNoteDialog(StateSetter setSheetState) {
-    _showNoteEditor(
-      title: 'Add Note',
-      onSave: (note) => _saveStandaloneNote(note, setSheetState),
+  Widget _headerButton(
+      String label, IconData icon, Color color, VoidCallback onTap) {
+    return Material(
+      color: color.withValues(alpha: 0.12),
+      borderRadius: BorderRadius.circular(16),
+      child: InkWell(
+        borderRadius: BorderRadius.circular(16),
+        onTap: onTap,
+        child: Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 11, vertical: 6),
+          child: Row(mainAxisSize: MainAxisSize.min, children: [
+            Icon(icon, size: 15, color: color),
+            const SizedBox(width: 4),
+            Text(label,
+                style: TextStyle(
+                    fontSize: 13, fontWeight: FontWeight.w600, color: color)),
+          ]),
+        ),
+      ),
     );
   }
 
-  /// Note editor sheet, shared by standalone notes and notes on highlights.
+  Future<bool?> _confirm(
+      {required String title,
+      required String message,
+      required String action}) {
+    return showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: Text(title),
+        content: Text(message),
+        actions: [
+          TextButton(
+              onPressed: () => Navigator.pop(ctx, false),
+              child: const Text('Cancel')),
+          TextButton(
+              onPressed: () => Navigator.pop(ctx, true),
+              child: Text(action,
+                  style: const TextStyle(
+                      color: AppColors.error, fontWeight: FontWeight.w600))),
+        ],
+      ),
+    );
+  }
+
+  /// A note for the current page (not attached to selected text).
+  Future<void> _addPageNote({VoidCallback? onSaved}) async {
+    final cfi = _currentCfi;
+    String? where;
+    if (cfi != null) {
+      final place =
+          (await EpubReaderBridge.describe(_epubController, [cfi])).firstOrNull;
+      if (!mounted) return;
+      where = [
+        if (place?.page != null) 'Page ${place!.page}',
+        if ((place?.chapter ?? '').isNotEmpty) place!.chapter,
+      ].join(' · ');
+    }
+    _showNoteEditor(
+      title: 'New Note',
+      subtitle: (where ?? '').isEmpty ? null : where,
+      onSave: (note) async {
+        await _saveStandaloneNote(note, cfi: cfi);
+        onSaved?.call();
+      },
+    );
+  }
+
+  void _editStandaloneNote(String id, {VoidCallback? onSaved}) {
+    final current = _standaloneNotes[id];
+    if (current == null) return;
+    _showNoteEditor(
+      title: 'Edit Note',
+      initial: current['note'] as String? ?? '',
+      allowEmpty: true,
+      onSave: (text) async {
+        final note = text.trim();
+        if (note.isEmpty) {
+          _deleteStandaloneNote(id);
+          onSaved?.call();
+          return;
+        }
+        setState(() => current['note'] = note);
+        onSaved?.call();
+        try {
+          await _highlightService.updateHighlightNote(id, note);
+        } catch (e) {
+          debugPrint('[EPUB] note not saved: $e');
+          _showSnack('Note not saved. Check your connection.');
+        }
+      },
+    );
+  }
+
+  /// Note editor sheet, shared by page notes and notes on highlights:
+  /// Cancel / title / Save, as in Apple's apps. Unsaved text is never lost
+  /// silently; an existing note can be deleted here.
   void _showNoteEditor({
     required String title,
     required ValueChanged<String> onSave,
     String initial = '',
     String quote = '',
+    String? subtitle,
     bool allowEmpty = false,
   }) {
-    final isDark =
-        Provider.of<ThemeProvider>(context, listen: false).isDarkMode;
+    final isDark = readingThemeIsDark(_readingTheme,
+        Provider.of<ThemeProvider>(context, listen: false).isDarkMode);
     final bgColor = isDark ? AppColors.darkCardBackground : Colors.white;
-    final textColor = isDark ? AppColors.darkTextPrimary : Colors.black;
+    final textColor =
+        isDark ? AppColors.darkTextPrimary : const Color(0xFF1C1C1E);
+    final mutedColor =
+        isDark ? AppColors.darkTextSecondary : const Color(0xFF6B6B70);
     final noteCtrl = TextEditingController(text: initial);
+    final original = initial.trim();
 
-    showModalBottomSheet(
+    showModalBottomSheet<void>(
       context: context,
       backgroundColor: bgColor,
       isScrollControlled: true,
+      isDismissible: false,
+      enableDrag: false,
+      useSafeArea: true,
       shape: const RoundedRectangleBorder(
           borderRadius: BorderRadius.vertical(top: Radius.circular(20))),
-      builder: (ctx) => Padding(
-        padding: EdgeInsets.only(bottom: MediaQuery.of(ctx).viewInsets.bottom),
-        child: SafeArea(
-            child: Column(
-          mainAxisSize: MainAxisSize.min,
-          crossAxisAlignment: CrossAxisAlignment.stretch,
-          children: [
-            Center(
-                child: Container(
-                    width: 36,
-                    height: 4,
-                    margin: const EdgeInsets.only(top: 12, bottom: 20),
-                    decoration: BoxDecoration(
-                        color: isDark ? Colors.white24 : Colors.black12,
-                        borderRadius: BorderRadius.circular(2)))),
-            Padding(
-                padding: const EdgeInsets.symmetric(horizontal: 20),
-                child: Text(title,
-                    style: TextStyle(
-                        fontFamily: 'SF Pro Display',
-                        fontWeight: FontWeight.w700,
-                        fontSize: 18,
-                        color: textColor))),
-            if (quote.trim().isNotEmpty)
-              Padding(
-                padding: const EdgeInsets.fromLTRB(20, 10, 20, 0),
-                child: Container(
-                  padding: const EdgeInsets.only(left: 10),
-                  decoration: BoxDecoration(
-                      border: Border(
-                          left: BorderSide(color: _readerAccent, width: 3))),
-                  child: Text(quote.trim(),
-                      maxLines: 3,
-                      overflow: TextOverflow.ellipsis,
-                      style: TextStyle(
-                          fontSize: 13,
-                          fontStyle: FontStyle.italic,
-                          color: isDark
-                              ? AppColors.darkTextSecondary
-                              : Colors.grey[700])),
-                ),
-              ),
-            const SizedBox(height: 12),
-            Padding(
-                padding: const EdgeInsets.symmetric(horizontal: 20),
-                child: TextField(
-                    controller: noteCtrl,
-                    maxLines: 4,
-                    maxLength: 500,
-                    autofocus: true,
-                    style:
-                        TextStyle(color: textColor, fontSize: 14, height: 1.5),
-                    decoration: InputDecoration(
-                        hintText: 'Write your note...',
-                        hintStyle: TextStyle(
-                            color: isDark
-                                ? AppColors.darkTextTertiary
-                                : Colors.grey[400]),
-                        filled: true,
-                        fillColor: isDark
-                            ? AppColors.darkSurface
-                            : const Color(0xFFF8F9FE),
-                        border: OutlineInputBorder(
-                            borderRadius: BorderRadius.circular(12),
-                            borderSide: BorderSide.none),
-                        focusedBorder: OutlineInputBorder(
-                            borderRadius: BorderRadius.circular(12),
-                            borderSide: BorderSide(
-                                color: _readerAccent, width: 1.5))))),
-            const SizedBox(height: 14),
-            Padding(
-                padding: const EdgeInsets.symmetric(horizontal: 20),
-                child: Row(children: [
-                  const Spacer(),
+      builder: (ctx) => StatefulBuilder(builder: (ctx, setEditor) {
+        final value = noteCtrl.text.trim();
+        final dirty = value != original;
+        final canSave =
+            dirty && (value.isNotEmpty || (allowEmpty && original.isNotEmpty));
+
+        Future<void> close() async {
+          if (dirty && value.isNotEmpty) {
+            final discard = await showDialog<bool>(
+              context: ctx,
+              builder: (d) => AlertDialog(
+                title: const Text('Discard changes?'),
+                content: const Text('Your note has not been saved.'),
+                actions: [
                   TextButton(
-                      onPressed: () => Navigator.pop(ctx),
-                      child: Text('Cancel',
+                      onPressed: () => Navigator.pop(d, false),
+                      child: const Text('Keep Editing')),
+                  TextButton(
+                      onPressed: () => Navigator.pop(d, true),
+                      child: const Text('Discard',
+                          style: TextStyle(color: AppColors.error))),
+                ],
+              ),
+            );
+            if (discard != true) return;
+          }
+          if (ctx.mounted) Navigator.pop(ctx);
+        }
+
+        void save() {
+          if (!canSave) return;
+          Navigator.pop(ctx);
+          onSave(value);
+        }
+
+        return PopScope(
+          canPop: !dirty,
+          onPopInvokedWithResult: (didPop, _) {
+            if (!didPop) close();
+          },
+          child: Padding(
+            padding:
+                EdgeInsets.only(bottom: MediaQuery.of(ctx).viewInsets.bottom),
+            child: SafeArea(
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                crossAxisAlignment: CrossAxisAlignment.stretch,
+                children: [
+                  Padding(
+                    padding: const EdgeInsets.fromLTRB(8, 8, 8, 0),
+                    child: Row(children: [
+                      TextButton(
+                          onPressed: close,
+                          child: Text('Cancel',
+                              style:
+                                  TextStyle(fontSize: 16, color: mutedColor))),
+                      Expanded(
+                          child: Text(title,
+                              textAlign: TextAlign.center,
+                              style: TextStyle(
+                                  fontFamily: 'SF Pro Display',
+                                  fontWeight: FontWeight.w600,
+                                  fontSize: 17,
+                                  color: textColor))),
+                      TextButton(
+                          onPressed: canSave ? save : null,
+                          child: Text('Save',
+                              style: TextStyle(
+                                  fontSize: 16,
+                                  fontWeight: FontWeight.w700,
+                                  color: canSave
+                                      ? _readerAccent
+                                      : mutedColor.withValues(alpha: 0.5)))),
+                    ]),
+                  ),
+                  if (subtitle != null)
+                    Padding(
+                      padding: const EdgeInsets.only(top: 2),
+                      child: Text(subtitle,
+                          textAlign: TextAlign.center,
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: TextStyle(fontSize: 12.5, color: mutedColor)),
+                    ),
+                  if (quote.trim().isNotEmpty)
+                    Padding(
+                      padding: const EdgeInsets.fromLTRB(20, 12, 20, 0),
+                      child: Container(
+                        padding: const EdgeInsets.only(left: 10),
+                        decoration: BoxDecoration(
+                            border: Border(
+                                left: BorderSide(
+                                    color: _readerAccent, width: 3))),
+                        child: Text(quote.trim(),
+                            maxLines: 3,
+                            overflow: TextOverflow.ellipsis,
+                            style: TextStyle(
+                                fontSize: 13.5,
+                                height: 1.35,
+                                fontStyle: FontStyle.italic,
+                                color: mutedColor)),
+                      ),
+                    ),
+                  Padding(
+                      padding: const EdgeInsets.fromLTRB(20, 12, 20, 0),
+                      child: TextField(
+                          controller: noteCtrl,
+                          minLines: 4,
+                          maxLines: 8,
+                          maxLength: 500,
+                          autofocus: true,
+                          textCapitalization: TextCapitalization.sentences,
+                          onChanged: (_) => setEditor(() {}),
                           style: TextStyle(
-                              color: isDark
-                                  ? AppColors.darkTextSecondary
-                                  : Colors.grey[600]))),
-                  const SizedBox(width: 8),
-                  Container(
-                      decoration: BoxDecoration(
-                          gradient: AppColors.blueGradient,
-                          borderRadius: BorderRadius.circular(24)),
-                      child: Material(
-                          color: Colors.transparent,
-                          child: InkWell(
-                              borderRadius: BorderRadius.circular(24),
-                              onTap: () {
-                                final note = noteCtrl.text.trim();
-                                if (note.isEmpty && !allowEmpty) return;
-                                Navigator.pop(ctx);
-                                onSave(note);
-                              },
-                              child: const Padding(
-                                  padding: EdgeInsets.symmetric(
-                                      horizontal: 24, vertical: 10),
-                                  child: Text('Save',
-                                      style: TextStyle(
-                                          color: Colors.white,
-                                          fontWeight: FontWeight.w600,
-                                          fontSize: 14)))))),
-                ])),
-            const SizedBox(height: 12),
-          ],
-        )),
-      ),
+                              color: textColor, fontSize: 15, height: 1.45),
+                          decoration: InputDecoration(
+                              hintText: 'Write your note…',
+                              hintStyle: TextStyle(
+                                  color: mutedColor.withValues(alpha: 0.7)),
+                              filled: true,
+                              fillColor: isDark
+                                  ? AppColors.darkSurface
+                                  : const Color(0xFFF6F6F8),
+                              border: OutlineInputBorder(
+                                  borderRadius: BorderRadius.circular(12),
+                                  borderSide: BorderSide.none),
+                              focusedBorder: OutlineInputBorder(
+                                  borderRadius: BorderRadius.circular(12),
+                                  borderSide: BorderSide(
+                                      color: _readerAccent, width: 1.5))))),
+                  if (allowEmpty && original.isNotEmpty)
+                    Padding(
+                      padding: const EdgeInsets.symmetric(horizontal: 12),
+                      child: Align(
+                        alignment: Alignment.centerLeft,
+                        child: TextButton.icon(
+                          onPressed: () {
+                            Navigator.pop(ctx);
+                            onSave('');
+                          },
+                          icon: const Icon(Icons.delete_outline,
+                              size: 18, color: AppColors.error),
+                          label: const Text('Delete Note',
+                              style: TextStyle(color: AppColors.error)),
+                        ),
+                      ),
+                    ),
+                  const SizedBox(height: 8),
+                ],
+              ),
+            ),
+          ),
+        );
+      }),
     ).whenComplete(() {
       // Disposed after the sheet's closing animation.
-      Future<void>.delayed(
-          const Duration(milliseconds: 400), noteCtrl.dispose);
+      Future<void>.delayed(const Duration(milliseconds: 400), noteCtrl.dispose);
     });
   }
 
-  Future<void> _saveStandaloneNote(
-      String note, StateSetter setSheetState) async {
-    if (widget.documentId == null) return;
+  Future<void> _saveStandaloneNote(String note, {String? cfi}) async {
+    if (widget.documentId == null || note.trim().isEmpty) return;
     try {
       final result = await _highlightService.addHighlight(
         documentId: widget.documentId!,
@@ -1621,19 +2061,28 @@ class _EpubViewerScreenState extends State<EpubViewerScreen>
         highlightedText: '',
         color: 'yellow',
         annotationType: 'note',
-        note: note,
+        note: _fitNote(note.trim()),
+        boundsData: cfi == null
+            ? null
+            : [
+                {
+                  'left': 0,
+                  'top': 0,
+                  'width': 0,
+                  'height': 0,
+                  'text': cfi,
+                  'page_number': 1
+                }
+              ],
       );
-      final id = result['highlight_id'] as String;
-      if (!mounted) return;
+      final id = result['highlight_id'] as String?;
+      if (id == null || !mounted) return;
       setState(() {
-        _standaloneNotes[id] = {'note': note};
+        _standaloneNotes[id] = {'note': _fitNote(note.trim()), 'cfi': cfi};
         _undoStack.add(id);
       });
-      setSheetState(() {});
     } catch (_) {
-      if (mounted)
-        showAppDialog(context,
-            message: 'Failed to save note', type: AppDialogType.info);
+      _showSnack('Note not saved. Check your connection.');
     }
   }
 
@@ -1703,9 +2152,9 @@ class _EpubViewerScreenState extends State<EpubViewerScreen>
                                         : Colors.grey[500]),
                                 maxLines: 1,
                                 overflow: TextOverflow.ellipsis)),
-                        // Tap the percentage to jump to a location.
+                        // Tap the page number (or percentage) to jump.
                         GestureDetector(
-                          onTap: _showGoToLocationDialog,
+                          onTap: _showGoToDialog,
                           behavior: HitTestBehavior.opaque,
                           child: Container(
                               padding: const EdgeInsets.symmetric(
@@ -1713,7 +2162,7 @@ class _EpubViewerScreenState extends State<EpubViewerScreen>
                               decoration: BoxDecoration(
                                   color: _readerAccent.withValues(alpha: 0.1),
                                   borderRadius: BorderRadius.circular(10)),
-                              child: Text('${(_readProgress * 100).toInt()}%',
+                              child: Text(_positionChipLabel,
                                   style: TextStyle(
                                       fontSize: 11,
                                       fontWeight: FontWeight.w600,
@@ -1759,13 +2208,7 @@ class _EpubViewerScreenState extends State<EpubViewerScreen>
               // Hidden: where you are in the chapter.
               : _immersiveBar(
                   top: false,
-                  text: !_isEpubReady
-                      ? ''
-                      : !_isScrollMode && _sectionPagesLeft != null
-                          ? (_sectionPagesLeft == 0
-                              ? 'Last page in chapter · ${(_readProgress * 100).toInt()}%'
-                              : '${_sectionPagesLeft!} ${_sectionPagesLeft == 1 ? 'page' : 'pages'} left in chapter · ${(_readProgress * 100).toInt()}%')
-                          : '${(_readProgress * 100).toInt()}%',
+                  text: !_isEpubReady ? '' : _immersivePositionText,
                   inset: MediaQuery.of(context).padding.bottom,
                   isDark: isDark),
         ]),
@@ -1795,10 +2238,7 @@ class _EpubViewerScreenState extends State<EpubViewerScreen>
       height: inset + height,
       child: Padding(
         padding: EdgeInsets.only(
-            top: top ? inset : 0,
-            bottom: top ? 0 : inset,
-            left: 48,
-            right: 48),
+            top: top ? inset : 0, bottom: top ? 0 : inset, left: 48, right: 48),
         child: Center(child: label),
       ),
     );
@@ -1807,34 +2247,74 @@ class _EpubViewerScreenState extends State<EpubViewerScreen>
   // ── Page navigation + go-to-location ──────────────────────────────
 
   /// Navigation inside the book. The book refuses to move while text is
-  /// selected, so the selection is cleared first.
-  void _displayCfi(String cfi) {
+  /// selected, so the selection is cleared first. [flash] briefly marks the
+  /// text at the target (search results).
+  void _displayCfi(String cfi, {bool flash = false}) {
     if (cfi.isEmpty) return;
     if (_hasSelection || _menu != null) _clearSelection();
-    _epubController.display(cfi: cfi);
+    unawaited(
+        EpubReaderBridge.goTo(_epubController, cfi, flash: flash).then((ok) {
+      if (!ok && mounted) _epubController.display(cfi: cfi);
+    }));
   }
 
-  void _onBookTouchDown(double x, double y) {
-    _touchDown = Offset(x, y);
-    _touchDownAt = DateTime.now();
+  // ── Touches on the book ───────────────────────────────────────────
+  //
+  // Seen by a Listener over the web view (not the book page's own touch
+  // events, which do not reliably arrive from inside its frame on iOS).
+  // The web view still gets every touch for text selection and scrolling.
+
+  static const _tapSlop = 12.0;
+
+  void _onPointerDown(PointerDownEvent e) {
+    if (_pointer != null) {
+      // A second finger: a pinch or two-finger gesture, never a tap.
+      _pointerMulti = true;
+      return;
+    }
+    _pointer = e.pointer;
+    _pointerDown = e.localPosition;
+    _pointerDownAt = DateTime.now();
+    _pointerMoved = false;
+    _pointerMulti = false;
     _touchDownHadSelection = _hasSelection;
   }
 
-  void _onBookTouchUp(double x, double y) {
-    final down = _touchDown;
-    final at = _touchDownAt;
-    _touchDown = null;
-    _touchDownAt = null;
-    if (down == null || at == null || !_isEpubReady || _imageFocused) return;
+  void _onPointerMove(PointerMoveEvent e) {
+    final down = _pointerDown;
+    if (e.pointer != _pointer || down == null) return;
+    if ((e.localPosition - down).distance > _tapSlop) _pointerMoved = true;
+  }
+
+  void _onPointerCancel(PointerCancelEvent e) {
+    if (e.pointer == _pointer) _pointer = null;
+  }
+
+  void _onPointerUp(PointerUpEvent e) {
+    if (e.pointer != _pointer) return;
+    final down = _pointerDown;
+    final at = _pointerDownAt;
+    final multi = _pointerMulti;
+    _pointer = null;
+    final size = _bookViewSize;
+    if (down == null ||
+        at == null ||
+        multi ||
+        size == null ||
+        size.isEmpty ||
+        !_isEpubReady ||
+        _imageFocused ||
+        _turning) {
+      return;
+    }
     final hadSelection = _touchDownHadSelection || _hasSelection;
-
-    final dx = x - down.dx;
-    final dy = y - down.dy;
+    final delta = e.localPosition - down;
     final heldMs = DateTime.now().difference(at).inMilliseconds;
+    final x = (e.localPosition.dx / size.width).clamp(0.0, 1.0);
+    final y = (e.localPosition.dy / size.height).clamp(0.0, 1.0);
 
-    // A quick, stationary touch is a tap. (A long press starts a text
-    // selection and must not toggle anything.)
-    if (dx.abs() < 0.03 && dy.abs() < 0.03 && heldMs < 350) {
+    // A quick, stationary touch is a tap. (Touch and hold selects text.)
+    if (!_pointerMoved && delta.distance <= _tapSlop && heldMs < 450) {
       if (_menu != null && !_menu!.forSelection) {
         setState(() => _menu = null);
         return;
@@ -1851,19 +2331,21 @@ class _EpubViewerScreenState extends State<EpubViewerScreen>
     // While text is selected, drags belong to the selection handles.
     if (hadSelection) return;
 
-    // iOS only: swipe left/right turns the page in paginated mode. On
+    // iOS only: a horizontal flick turns the page in paginated mode. On
     // Android the book page detects swipes itself and asks for the turn
     // (EpubReaderBridge), so doing it here too would turn two pages.
     if (Platform.isIOS &&
         !_isScrollMode &&
-        dx.abs() >= 0.12 &&
-        dx.abs() > dy.abs() * 1.5) {
-      unawaited(_turnPage(forward: dx < 0));
+        heldMs < 700 &&
+        delta.dx.abs() >= math.max(40.0, size.width * 0.12) &&
+        delta.dx.abs() > delta.dy.abs() * 1.5) {
+      unawaited(_turnPage(forward: delta.dx < 0));
     }
   }
 
-  /// Tap on the book: open an image, show the menu for a highlight, follow
-  /// a link (the book does that), or show/hide the reader controls.
+  /// Tap on the book: open an image, table or figure; the menu (or note)
+  /// of a highlight; follow a link (the book does that); turn the page at
+  /// the left/right edge; or show/hide the reader controls.
   Future<void> _handleTap(double x, double y) async {
     final generation = _viewerGeneration;
     final target = await EpubReaderBridge.tapAt(_epubController, x, y);
@@ -1877,28 +2359,94 @@ class _EpubViewerScreenState extends State<EpubViewerScreen>
     switch (target.kind) {
       case 'image':
         await _openImage(target);
+        return;
+      case 'table':
+      case 'figure':
+        await _openFocusMarkup(target);
+        return;
       case 'annotation':
-        _showAnnotationMenu(target);
-      case 'link':
-        break;
-      default:
-        // Line guide on: a tap outside the reading window moves it to the
-        // tapped line (Apple Books-style); inside it shows/hides controls.
-        final height = _bookViewSize?.height ?? 0;
-        if (_lineGuide && height > 0) {
-          final band = EpubLineGuide.bandRect(
-              _guide.value, _guideBandHeight, _bookViewSize!);
-          if (!band.contains(Offset(band.center.dx, y * height))) {
-            if (_guideHint) setState(() => _guideHint = false);
-            unawaited(_moveGuideToLine(x, y));
+        if (target.noteTap) {
+          final withNote = [
+            for (final hit in target.annotations)
+              if (_annotations[EpubAnnotation.keyFor(hit.type, hit.cfi)]
+                      ?.hasNote ??
+                  false)
+                _annotations[EpubAnnotation.keyFor(hit.type, hit.cfi)]!
+          ];
+          if (withNote.isNotEmpty) {
+            _editNote(withNote.first);
             return;
           }
         }
-        setState(() {
-          _menu = null;
-          _chromeVisible = !_chromeVisible;
-        });
+        _showAnnotationMenu(target);
+        return;
+      case 'link':
+        return;
     }
+    // Line guide on: a tap outside the reading window moves it to the
+    // tapped line (Apple Books-style).
+    final height = _bookViewSize?.height ?? 0;
+    if (_lineGuide && height > 0) {
+      final band = EpubLineGuide.bandRect(
+          _guide.value, _guideBandHeight, _bookViewSize!);
+      if (!band.contains(Offset(band.center.dx, y * height))) {
+        if (_guideHint) setState(() => _guideHint = false);
+        unawaited(_moveGuideToLine(x, y));
+        return;
+      }
+    }
+    // Paginated: the outer edges turn the page, as in Apple Books.
+    if (!_isScrollMode && (x < 0.12 || x > 0.88)) {
+      if (_menu != null) setState(() => _menu = null);
+      unawaited(_turnPage(forward: x > 0.5));
+      return;
+    }
+    setState(() {
+      _menu = null;
+      _chromeVisible = !_chromeVisible;
+    });
+  }
+
+  /// A table or figure, enlarged on its own (pinch to zoom, scroll), as in
+  /// Apple Books.
+  Future<void> _openFocusMarkup(EpubTapTarget target) async {
+    _imageFocused = true;
+    try {
+      final markup = await EpubReaderBridge.focusMarkup(_epubController);
+      if (!mounted) return;
+      if (markup == null) {
+        _showSnack(target.kind == 'table'
+            ? 'This table could not be opened.'
+            : 'This figure could not be opened.');
+        return;
+      }
+      final isDark = readingThemeIsDark(_readingTheme,
+          Provider.of<ThemeProvider>(context, listen: false).isDarkMode);
+      await showEpubMarkupFocus(
+        context,
+        markup: markup,
+        origin: _globalRect(target.rect),
+        dark: isDark,
+        title: (target.label ?? '').trim().isNotEmpty
+            ? target.label!.trim()
+            : (target.kind == 'table' ? 'Table' : 'Figure'),
+      );
+    } finally {
+      _imageFocused = false;
+    }
+  }
+
+  /// Screen rectangle of a normalized rectangle in the book view.
+  Rect _globalRect(Rect? r) {
+    final screen = MediaQuery.sizeOf(context);
+    final fallback = Rect.fromCenter(
+        center: screen.center(Offset.zero), width: 48, height: 48);
+    final box = _bookKey.currentContext?.findRenderObject() as RenderBox?;
+    if (box == null || !box.attached || r == null) return fallback;
+    final size = box.size;
+    final o = box.localToGlobal(Offset.zero);
+    return Rect.fromLTWH(o.dx + r.left * size.width, o.dy + r.top * size.height,
+        r.width * size.width, r.height * size.height);
   }
 
   Future<void> _openImage(EpubTapTarget target) async {
@@ -1912,18 +2460,7 @@ class _EpubViewerScreenState extends State<EpubViewerScreen>
         _showSnack('This image could not be opened.');
         return;
       }
-      final screen = MediaQuery.sizeOf(context);
-      var origin = Rect.fromCenter(
-          center: screen.center(Offset.zero), width: 48, height: 48);
-      final box = _bookKey.currentContext?.findRenderObject() as RenderBox?;
-      final r = target.rect;
-      if (box != null && box.attached && r != null) {
-        final size = box.size;
-        final o = box.localToGlobal(Offset.zero);
-        origin = Rect.fromLTWH(o.dx + r.left * size.width,
-            o.dy + r.top * size.height, r.width * size.width,
-            r.height * size.height);
-      }
+      final origin = _globalRect(target.rect);
       // The image leaves the page while it is focused, as in Apple Books,
       // and returns to the same spot on the same page when closed.
       await EpubReaderBridge.setFocusedImageHidden(_epubController, true);
@@ -1960,10 +2497,10 @@ class _EpubViewerScreenState extends State<EpubViewerScreen>
     final startCfi = _currentCfi;
     // Curl turns one sheet; in a two-page spread both pages would bend as
     // one, so spreads slide instead.
-    final style = _pageTurn == EpubPageTurn.curl &&
-            (_curlProgram == null || _isSpread)
-        ? EpubPageTurn.slide
-        : _pageTurn;
+    final style =
+        _pageTurn == EpubPageTurn.curl && (_curlProgram == null || _isSpread)
+            ? EpubPageTurn.slide
+            : _pageTurn;
     final animate =
         !(MediaQuery.maybeOf(context)?.disableAnimations ?? false) &&
             !_snapshotsUnavailable;
@@ -2115,16 +2652,59 @@ class _EpubViewerScreenState extends State<EpubViewerScreen>
     return true;
   }
 
-  Future<void> _showGoToLocationDialog() async {
+  /// "12 / 340" when the book has page numbers, otherwise "37%".
+  String get _positionChipLabel {
+    final pages = _pageInfo;
+    if (pages != null && pages.current != null) {
+      return '${pages.current} / ${pages.total}';
+    }
+    return '${(_readProgress * 100).toInt()}%';
+  }
+
+  /// Bottom line while the controls are hidden: page, then what is left of
+  /// the chapter.
+  String get _immersivePositionText {
+    final pages = _pageInfo;
+    final parts = <String>[
+      if (pages != null && pages.current != null)
+        'Page ${pages.current} of ${pages.total}'
+      else
+        '${(_readProgress * 100).toInt()}%',
+      if (!_isScrollMode && _sectionPagesLeft != null)
+        _sectionPagesLeft == 0
+            ? 'Last page in chapter'
+            : '${_sectionPagesLeft!} ${_sectionPagesLeft == 1 ? 'page' : 'pages'} left in chapter',
+    ];
+    return parts.join(' · ');
+  }
+
+  /// Go to a page (or, before the book's page numbers are ready, to a
+  /// percentage of the book).
+  Future<void> _showGoToDialog() async {
     if (!_isEpubReady) return;
     final isDark =
         Provider.of<ThemeProvider>(context, listen: false).isDarkMode;
+    final pages = _pageInfo;
     final value = await showDialog<int>(
       context: context,
-      builder: (_) => _GoToLocationDialog(
-        initialPercent: (_readProgress * 100).round().clamp(0, 100),
-        isDark: isDark,
-      ),
+      builder: (_) => pages != null
+          ? _GoToLocationDialog(
+              title: 'Go to page',
+              label: 'Page (1–${pages.total})',
+              min: 1,
+              max: pages.total,
+              initial: pages.current ?? 1,
+              isDark: isDark,
+            )
+          : _GoToLocationDialog(
+              title: 'Go to location',
+              label: 'Percentage of the book',
+              suffix: '%',
+              min: 0,
+              max: 100,
+              initial: (_readProgress * 100).round().clamp(0, 100),
+              isDark: isDark,
+            ),
     );
     if (value == null || !mounted) return;
     // Let the dialog and the keyboard finish closing first. Hiding the keyboard
@@ -2132,7 +2712,21 @@ class _EpubViewerScreenState extends State<EpubViewerScreen>
     // its previous location, which would undo a jump made at the same moment.
     await Future<void>.delayed(const Duration(milliseconds: 450));
     if (!mounted) return;
-    await _jumpToProgress((value / 100).clamp(0.0, 1.0));
+    if (pages != null) {
+      await _jumpToPage(value);
+    } else {
+      await _jumpToProgress((value / 100).clamp(0.0, 1.0));
+    }
+  }
+
+  Future<void> _jumpToPage(int page) async {
+    final target = await EpubReaderBridge.targetForPage(_epubController, page);
+    if (!mounted) return;
+    if (target == null) {
+      _showSnack('Page $page could not be found in this book.');
+      return;
+    }
+    _displayCfi(target);
   }
 
   Future<void> _jumpToProgress(double progress) async {
@@ -2302,7 +2896,9 @@ class _EpubViewerScreenState extends State<EpubViewerScreen>
                 style:
                     TextStyle(fontSize: isTablet ? 16 : 14, color: textColor),
                 decoration: InputDecoration(
-                    hintText: 'Search in book...',
+                    hintText: _pageInfo != null
+                        ? 'Search the book or enter a page number'
+                        : 'Search in book...',
                     hintStyle: TextStyle(
                         color:
                             isDark ? AppColors.darkTextSecondary : Colors.grey),
@@ -2317,17 +2913,41 @@ class _EpubViewerScreenState extends State<EpubViewerScreen>
                     border: OutlineInputBorder(
                         borderRadius: BorderRadius.circular(isTablet ? 12 : 8),
                         borderSide: BorderSide.none)),
+                textInputAction: TextInputAction.search,
                 onSubmitted: (value) async {
                   if (value.trim().isNotEmpty &&
                       _isEpubReady &&
                       !_isSearchBusy) {
                     _isSearchBusy = true;
                     try {
+                      // A number can be a page to go to (offered first, as
+                      // in Apple Books) as well as text to find.
+                      final asPage = int.tryParse(value.trim());
+                      final pages = _pageInfo;
+                      final page = asPage != null &&
+                              pages != null &&
+                              asPage >= 1 &&
+                              asPage <= pages.total
+                          ? asPage
+                          : null;
                       final results =
                           await searchEpubBook(_epubController, value);
                       if (!mounted) return;
-                      final cfi = await showEpubSearchResults(context, results);
-                      if (mounted && cfi != null) _displayCfi(cfi);
+                      final choice = await showEpubSearchResults(
+                          context, results,
+                          page: page, totalPages: pages?.total, query: value);
+                      if (!mounted || choice == null) return;
+                      FocusManager.instance.primaryFocus?.unfocus();
+                      if (choice.page != null) {
+                        // Let the keyboard close first (it resizes the book).
+                        await Future<void>.delayed(
+                            const Duration(milliseconds: 350));
+                        if (mounted) await _jumpToPage(choice.page!);
+                      } else if (choice.cfi != null) {
+                        await Future<void>.delayed(
+                            const Duration(milliseconds: 350));
+                        if (mounted) _displayCfi(choice.cfi!, flash: true);
+                      }
                     } catch (e) {
                       if (mounted) {
                         showAppDialog(context,
@@ -2470,102 +3090,106 @@ class _EpubViewerScreenState extends State<EpubViewerScreen>
     return LayoutBuilder(builder: (context, constraints) {
       _onBookViewSize(constraints.biggest);
       return Stack(key: _bookKey, children: [
-        EpubViewer(
-          key: ValueKey('epub-viewer-$_viewerGeneration'),
-          epubSource: epubSource,
-          epubController: _epubController,
-          initialCfi: _resumeCfi,
-          displaySettings: EpubDisplaySettings(
-              fontSize: _fontSize,
-              spread: _wantsSpread(constraints.biggest)
-                  ? EpubSpread.auto
-                  : EpubSpread.none,
-              flow: _isScrollMode ? EpubFlow.scrolled : EpubFlow.paginated,
-              // iOS: epub.js's snap paging never sees touches made inside the
-              // book's iframe, so a drag free-scrolled the pages (half-turned or
-              // blank pages) and a swipe could also trigger our own turn. Off on
-              // iOS: pages turn only via next()/prev() (swipe + arrow buttons),
-              // and _applyBookLayoutFixes stops drags from moving the pages.
-              // Android scroll mode: no snap. The package turns snap into
-              // disableVerticalScroll on the web view, so the book could not be
-              // scrolled at all in scroll mode on Android.
-              snap: !Platform.isIOS && !_isScrollMode,
-              useSnapAnimationAndroid: false,
-              theme: _currentReadingTheme(),
-              allowScriptedContent: false),
-          // The reader shows its own selection menu (EpubAnnotationMenu).
-          // flutter_inappwebview's native custom menu items are not used:
-          // on iOS they are kept on the web view class by memory address
-          // after the web view is gone, and a later web view at the same
-          // address runs the freed action (the Underline crash).
-          suppressNativeContextMenu: true,
-          onChaptersLoaded: (chapters) {
-            if (generation != _viewerGeneration) return;
-            _chapters = chapters;
-            _chaptersReady = true;
-            _markReaderReady();
-          },
-          onEpubLoaded: () {
-            if (generation != _viewerGeneration) return;
-            _pageDisplayed = true;
-            _markReaderReady();
-          },
-          onRelocated: (value) {
-            if (generation != _viewerGeneration) return;
-            final pendingTurn = _turnRelocated;
-            if (pendingTurn != null && !pendingTurn.isCompleted) {
-              pendingTurn.complete(value.startCfi);
-            }
-            if (mounted) {
-              _currentCfi = value.startCfi;
-              unawaited(_refreshSectionPages(value.startCfi));
-              if (widget.documentId != null &&
-                  _readerUserId != null &&
-                  value.startCfi.isNotEmpty) {
-                unawaited(SharedPreferences.getInstance().then((prefs) =>
-                    prefs.setString(
-                        'epub_position_${_readerUserId}_${widget.source ?? 'ebook'}_${widget.documentId}',
-                        value.startCfi)));
+        Listener(
+          onPointerDown: _onPointerDown,
+          onPointerMove: _onPointerMove,
+          onPointerUp: _onPointerUp,
+          onPointerCancel: _onPointerCancel,
+          child: EpubViewer(
+            key: ValueKey('epub-viewer-$_viewerGeneration'),
+            epubSource: epubSource,
+            epubController: _epubController,
+            initialCfi: _resumeCfi,
+            displaySettings: EpubDisplaySettings(
+                fontSize: _fontSize,
+                spread: _wantsSpread(constraints.biggest)
+                    ? EpubSpread.auto
+                    : EpubSpread.none,
+                flow: _isScrollMode ? EpubFlow.scrolled : EpubFlow.paginated,
+                // iOS: epub.js's snap paging never sees touches made inside the
+                // book's iframe, so a drag free-scrolled the pages (half-turned or
+                // blank pages) and a swipe could also trigger our own turn. Off on
+                // iOS: pages turn only via next()/prev() (swipe + arrow buttons),
+                // and _applyBookLayoutFixes stops drags from moving the pages.
+                // Android scroll mode: no snap. The package turns snap into
+                // disableVerticalScroll on the web view, so the book could not be
+                // scrolled at all in scroll mode on Android.
+                snap: !Platform.isIOS && !_isScrollMode,
+                useSnapAnimationAndroid: false,
+                theme: _currentReadingTheme(),
+                allowScriptedContent: false),
+            // The reader shows its own selection menu (EpubAnnotationMenu).
+            // flutter_inappwebview's native custom menu items are not used:
+            // on iOS they are kept on the web view class by memory address
+            // after the web view is gone, and a later web view at the same
+            // address runs the freed action (the Underline crash).
+            suppressNativeContextMenu: true,
+            onChaptersLoaded: (chapters) {
+              if (generation != _viewerGeneration) return;
+              _chapters = chapters;
+              _chaptersReady = true;
+              _markReaderReady();
+            },
+            onEpubLoaded: () {
+              if (generation != _viewerGeneration) return;
+              _pageDisplayed = true;
+              _markReaderReady();
+            },
+            onRelocated: (value) {
+              if (generation != _viewerGeneration) return;
+              final pendingTurn = _turnRelocated;
+              if (pendingTurn != null && !pendingTurn.isCompleted) {
+                pendingTurn.complete(value.startCfi);
               }
-              setState(() {
-                final reported = value.progress.isFinite
-                    ? value.progress.clamp(0.0, 1.0)
-                    : 0.0;
-                // epub.js can relocate to a saved CFI before its location
-                // index is generated. Keep the prior progress until the
-                // measured value arrives from _refreshSectionPages.
-                if (reported > 0 || _readProgress == 0) {
-                  _readProgress = reported;
+              if (mounted) {
+                _currentCfi = value.startCfi;
+                unawaited(_refreshSectionPages(value.startCfi));
+                if (widget.documentId != null &&
+                    _readerUserId != null &&
+                    value.startCfi.isNotEmpty) {
+                  unawaited(SharedPreferences.getInstance().then((prefs) =>
+                      prefs.setString(
+                          'epub_position_${_readerUserId}_${widget.source ?? 'ebook'}_${widget.documentId}',
+                          value.startCfi)));
                 }
-                _menu = null;
-                _updateBookmarkState();
-              });
-            }
-          },
-          onTextSelected: (sel) {
-            if (generation != _viewerGeneration) return;
-            _selectedCfi = sel.selectionCfi;
-            _selectedText = sel.selectedText;
-            _hasSelection = true;
-          },
-          onSelection: (text, cfi, rect, viewRect) {
-            if (!mounted || generation != _viewerGeneration) return;
-            if (cfi.isEmpty || _imageFocused) return;
-            setState(() => _menu = _ReaderMenu(rect, const []));
-          },
-          onSelectionChanging: () {
-            if (mounted && (_menu?.forSelection ?? false)) {
-              setState(() => _menu = null);
-            }
-          },
-          onDeselection: () {
-            _hasSelection = false;
-            if (mounted && (_menu?.forSelection ?? false)) {
-              setState(() => _menu = null);
-            }
-          },
-          onTouchDown: _onBookTouchDown,
-          onTouchUp: _onBookTouchUp,
+                setState(() {
+                  final reported = value.progress.isFinite
+                      ? value.progress.clamp(0.0, 1.0)
+                      : 0.0;
+                  // epub.js can relocate to a saved CFI before its location
+                  // index is generated. Keep the prior progress until the
+                  // measured value arrives from _refreshSectionPages.
+                  if (reported > 0 || _readProgress == 0) {
+                    _readProgress = reported;
+                  }
+                  _menu = null;
+                });
+                unawaited(_updateBookmarkState());
+              }
+            },
+            onTextSelected: (sel) {
+              if (generation != _viewerGeneration) return;
+              _selectedCfi = sel.selectionCfi;
+              _selectedText = sel.selectedText;
+              _hasSelection = true;
+            },
+            onSelection: (text, cfi, rect, viewRect) {
+              if (!mounted || generation != _viewerGeneration) return;
+              if (cfi.isEmpty || _imageFocused) return;
+              setState(() => _menu = _ReaderMenu(rect, const []));
+            },
+            onSelectionChanging: () {
+              if (mounted && (_menu?.forSelection ?? false)) {
+                setState(() => _menu = null);
+              }
+            },
+            onDeselection: () {
+              _hasSelection = false;
+              if (mounted && (_menu?.forSelection ?? false)) {
+                setState(() => _menu = null);
+              }
+            },
+          ),
         ),
         // Page turn in progress: stills of the page over the book (see
         // _turnPage). Touches on the book wait until the turn is done.
@@ -2625,11 +3249,35 @@ class _EpubViewerScreenState extends State<EpubViewerScreen>
                   dimming: _guideDimming,
                   accentColor: _readerAccent,
                   bandHeight: _guideBandHeight,
-                  stepHeight: _guidePitch == null
-                      ? null
-                      : _guideLines * _guidePitch!,
+                  stepHeight:
+                      _guidePitch == null ? null : _guideLines * _guidePitch!,
                   dark: isDark,
                   showHint: _guideHint)),
+        // Bookmarked page: a ribbon at the top corner, as in Apple Books.
+        if (_isEpubReady && !_isScrollMode)
+          Positioned(
+            top: 0,
+            right: 18,
+            child: IgnorePointer(
+              child: AnimatedSlide(
+                offset: _isCurrentLocationBookmarked
+                    ? Offset.zero
+                    : const Offset(0, -1),
+                duration: const Duration(milliseconds: 220),
+                curve: Curves.easeOutCubic,
+                child: AnimatedOpacity(
+                  opacity: _isCurrentLocationBookmarked ? 1 : 0,
+                  duration: const Duration(milliseconds: 180),
+                  child: CustomPaint(
+                    size: const Size(16, 26),
+                    painter: _BookmarkRibbonPainter(isDark
+                        ? const Color(0xFFFF6961)
+                        : const Color(0xFFE5484D)),
+                  ),
+                ),
+              ),
+            ),
+          ),
         if (_isEpubReady && _menu != null)
           _buildMenu(_menu!, constraints.biggest, isDark),
         if (!_isEpubReady)
@@ -2827,14 +3475,69 @@ class _EpubViewerScreenState extends State<EpubViewerScreen>
 /// controller and focus node so they are disposed with the dialog, and takes
 /// focus after the first frame (same pattern as the PDF viewer's go-to-page
 /// dialog; TextField's built-in autofocus races with disposal).
-class _GoToLocationDialog extends StatefulWidget {
-  final int initialPercent;
-  final bool isDark;
+/// The bookmark ribbon drawn at the top corner of a bookmarked page.
+class _BookmarkRibbonPainter extends CustomPainter {
+  const _BookmarkRibbonPainter(this.color);
+  final Color color;
 
-  const _GoToLocationDialog({
-    required this.initialPercent,
-    required this.isDark,
+  @override
+  void paint(Canvas canvas, Size size) {
+    final notch = size.height * 0.24;
+    final path = Path()
+      ..moveTo(0, 0)
+      ..lineTo(size.width, 0)
+      ..lineTo(size.width, size.height)
+      ..lineTo(size.width / 2, size.height - notch)
+      ..lineTo(0, size.height)
+      ..close();
+    canvas.drawShadow(path, Colors.black, 2, false);
+    canvas.drawPath(path, Paint()..color = color);
+  }
+
+  @override
+  bool shouldRepaint(covariant _BookmarkRibbonPainter old) =>
+      old.color != color;
+}
+
+/// One row of the Notes & Highlights panel: a highlight/underline or a
+/// note, with where it is in the book.
+class _NotesItem {
+  const _NotesItem({
+    this.annotation,
+    this.noteId,
+    this.note = '',
+    this.cfi,
+    this.chapter = '',
+    this.page,
+    required this.order,
   });
+  final EpubAnnotation? annotation;
+  final String? noteId;
+  final String note;
+  final String? cfi;
+  final String chapter;
+  final int? page;
+  final int order;
+}
+
+class _GoToLocationDialog extends StatefulWidget {
+  const _GoToLocationDialog({
+    required this.title,
+    required this.label,
+    required this.min,
+    required this.max,
+    required this.initial,
+    required this.isDark,
+    this.suffix,
+  });
+
+  final String title;
+  final String label;
+  final String? suffix;
+  final int min;
+  final int max;
+  final int initial;
+  final bool isDark;
 
   @override
   State<_GoToLocationDialog> createState() => _GoToLocationDialogState();
@@ -2848,7 +3551,7 @@ class _GoToLocationDialogState extends State<_GoToLocationDialog> {
   @override
   void initState() {
     super.initState();
-    _controller = TextEditingController(text: widget.initialPercent.toString());
+    _controller = TextEditingController(text: widget.initial.toString());
     _focusNode = FocusNode();
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (!mounted) return;
@@ -2867,8 +3570,9 @@ class _GoToLocationDialogState extends State<_GoToLocationDialog> {
 
   void _submit() {
     final v = int.tryParse(_controller.text.trim());
-    if (v == null || v < 0 || v > 100) {
-      setState(() => _error = 'Enter a number from 0 to 100');
+    if (v == null || v < widget.min || v > widget.max) {
+      setState(
+          () => _error = 'Enter a number from ${widget.min} to ${widget.max}');
       return;
     }
     Navigator.of(context).pop(v);
@@ -2879,16 +3583,17 @@ class _GoToLocationDialogState extends State<_GoToLocationDialog> {
     return AlertDialog(
       backgroundColor:
           widget.isDark ? AppColors.darkCardBackground : Colors.white,
-      title: const Text('Go to location'),
+      title: Text(widget.title),
       content: TextField(
         controller: _controller,
         focusNode: _focusNode,
         keyboardType: TextInputType.number,
+        textInputAction: TextInputAction.go,
         inputFormatters: [FilteringTextInputFormatter.digitsOnly],
         onSubmitted: (_) => _submit(),
         decoration: InputDecoration(
-          labelText: 'Percentage of the book',
-          suffixText: '%',
+          labelText: widget.label,
+          suffixText: widget.suffix,
           errorText: _error,
         ),
       ),
