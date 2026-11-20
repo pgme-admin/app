@@ -1,7 +1,7 @@
 name: pgme
 description: Post Graduate Medical Education - A complete medical education platform
 publish_to: 'none'
-version: 2.0.8+35
+version: 2.0.8+38
 
 environment:
   sdk: '>=3.0.0 <4.0.0'
@@ -76,6 +76,13 @@ dev_dependencies:
 dependency_overrides:
   pdfrx:
     path: vendor/pdfrx
+  # Vendored flutter_epub_viewer 1.2.8, patched so the book reaches the web
+  # view in base64 pieces instead of one giant JS array literal (a 46 MB
+  # EPUB made a 172 MB script; iOS killed the web view and the app). See the
+  # "PGME patch" comments in vendor/flutter_epub_viewer/lib/src/epub_viewer.dart
+  # and lib/assets/webpage/html/epubView.js.
+  flutter_epub_viewer:
+    path: vendor/flutter_epub_viewer
 
 flutter_launcher_icons:
   android: "ic_launcher"
