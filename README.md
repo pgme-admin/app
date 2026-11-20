@@ -202,8 +202,15 @@ flutter build apk --release
 Android ships `lib/main.dart` (`core/` + `features/`). `lib/main_android.dart`
 is a thin alias for it, so `-t lib/main_android.dart` builds the identical app —
 the two used to boot different trees, and picking the wrong one silently
-shipped a build missing Workshops and the All Packages card. `lib/main_ios.dart`
-is genuinely separate: iOS runs reader-mode with no purchase or payment flow.
+shipped a build missing Workshops and the All Packages card.
+
+iOS ships the same `lib/main.dart` (`ios/Flutter/Release.xcconfig` pins
+`FLUTTER_TARGET`). It is what App Store 2.0.6 and every TestFlight build up to
+2.0.7 (29) ran; purchases on iOS open the web store
+(`WebStoreLauncher.shouldUseWebStore` is `Platform.isIOS`). `lib/main_ios.dart`
+boots the older `core_ios/` + `features_ios/` copy, which lacks the current
+PDF reader (annotation tools in "Read Notes Alongside", one-page view); builds
+2.0.8 (32)–(36) shipped it by mistake. Do not point iOS back at it.
 
 **Android App Bundle**
 ```bash
@@ -212,7 +219,7 @@ flutter build appbundle --release
 
 **iOS**
 ```bash
-flutter build ios --release -t lib/main_ios.dart
+flutter build ios --release
 ```
 
 ## 🔧 Configuration
