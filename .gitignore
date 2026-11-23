@@ -13,7 +13,6 @@
 migrate_working_dir/
 
 # Environment variables
-.env
 
 *.md
 .md
@@ -110,3 +109,5 @@ vendor/pdfrx/assets/pdfium.wasm
 # Keep ignored so future `git add .` doesn't re-add them.
 /git
 /separate
+config.bat
+node_modules

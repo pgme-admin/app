@@ -1084,17 +1084,19 @@ class _EpubViewerScreenState extends State<EpubViewerScreen>
     final messenger = ScaffoldMessenger.of(context);
     messenger.hideCurrentSnackBar();
     // Floats above the reader's bottom bar so it never covers Undo.
-    final media = MediaQuery.of(context);
-    final barHeight = _chromeVisible
-        ? (ResponsiveHelper.isTablet(context) ? 84.0 : 66.0) +
-            media.padding.bottom
-        : media.padding.bottom + 26;
+    // The bottom bar keeps its space while hidden (see build).
+    final media = readerMediaWithoutKeyboard(MediaQuery.of(context));
+    final barHeight = (ResponsiveHelper.isTablet(context) ? 84.0 : 66.0) +
+        media.padding.bottom;
     messenger.showSnackBar(SnackBar(
       content: Text(message),
       action: action,
       behavior: SnackBarBehavior.floating,
       margin: EdgeInsets.fromLTRB(16, 0, 16, barHeight + 8),
       duration: Duration(seconds: action == null ? 2 : 4),
+      // Flutter keeps a snack bar with an action (Undo) on screen until it
+      // is tapped; the reader's fades away like the others.
+      persist: false,
     ));
   }
 
@@ -1332,7 +1334,7 @@ class _EpubViewerScreenState extends State<EpubViewerScreen>
     final box = _bookKey.currentContext?.findRenderObject() as RenderBox?;
     final r = target.rect;
     if (keys.isEmpty || box == null || r == null) {
-      setState(() => _chromeVisible = !_chromeVisible);
+      _toggleChrome();
       return;
     }
     final size = box.size;
@@ -2172,7 +2174,7 @@ class _EpubViewerScreenState extends State<EpubViewerScreen>
           backgroundColor: backgroundColor,
           appBar: AppBar(
               toolbarHeight: 0,
-              backgroundColor: toolbarColor,
+              backgroundColor: _chromeVisible ? toolbarColor : pageColor,
               elevation: 0,
               scrolledUnderElevation: 0,
               systemOverlayStyle: isDark
@@ -2181,78 +2183,75 @@ class _EpubViewerScreenState extends State<EpubViewerScreen>
                   : SystemUiOverlayStyle.dark
                       .copyWith(statusBarColor: Colors.transparent)),
           body: Column(children: [
-            // No size animation here: every intermediate size would make the
-            // book engine re-layout mid-animation (see _onBookViewSize).
-            _chromeVisible
-                ? Column(children: [
-                    _buildToolbar(isDark, textColor, toolbarColor, isTablet),
-                    // Chapter + progress indicator. Space is reserved even
-                    // before the book is ready so the book view keeps one size
-                    // from the start (a resize right after the first page is
-                    // drawn could leave the book on a blank page).
-                    Visibility(
-                      visible: _isEpubReady,
-                      maintainSize: true,
-                      maintainAnimation: true,
-                      maintainState: true,
-                      child: Container(
-                        width: double.infinity,
-                        padding: const EdgeInsets.symmetric(
-                            horizontal: 16, vertical: 4),
-                        color: toolbarColor,
-                        child: Row(children: [
-                          Expanded(
-                              child: Text(
-                                  !_isScrollMode && _sectionPagesLeft != null
-                                      ? '${_sectionPagesLeft!} pages left in section'
-                                      : _currentChapter.isNotEmpty
-                                          ? _currentChapter
-                                          : widget.title,
+            // The controls keep their space while hidden, so the book never
+            // changes size when they are shown or hidden (see _chromeBand).
+            _chromeBand(
+                pageColor: pageColor,
+                // Hidden (immersive, as in Apple Books): just the book title.
+                immersive: _immersiveBar(
+                    top: true, text: widget.title, inset: 0, isDark: isDark),
+                chrome: Column(children: [
+                  _buildToolbar(isDark, textColor, toolbarColor, isTablet),
+                  // Chapter + progress indicator. Space is reserved even
+                  // before the book is ready so the book view keeps one size
+                  // from the start (a resize right after the first page is
+                  // drawn could leave the book on a blank page).
+                  Visibility(
+                    visible: _isEpubReady,
+                    maintainSize: true,
+                    maintainAnimation: true,
+                    maintainState: true,
+                    child: Container(
+                      width: double.infinity,
+                      padding: const EdgeInsets.symmetric(
+                          horizontal: 16, vertical: 4),
+                      color: toolbarColor,
+                      child: Row(children: [
+                        Expanded(
+                            child: Text(
+                                !_isScrollMode && _sectionPagesLeft != null
+                                    ? '${_sectionPagesLeft!} pages left in section'
+                                    : _currentChapter.isNotEmpty
+                                        ? _currentChapter
+                                        : widget.title,
+                                style: TextStyle(
+                                    fontSize: 11,
+                                    color: isDark
+                                        ? AppColors.darkTextTertiary
+                                        : Colors.grey[500]),
+                                maxLines: 1,
+                                overflow: TextOverflow.ellipsis)),
+                        // Tap the page number (or percentage) to jump.
+                        GestureDetector(
+                          onTap: _showGoToDialog,
+                          behavior: HitTestBehavior.opaque,
+                          child: Container(
+                              padding: const EdgeInsets.symmetric(
+                                  horizontal: 10, vertical: 4),
+                              decoration: BoxDecoration(
+                                  color: _readerAccent.withValues(alpha: 0.1),
+                                  borderRadius: BorderRadius.circular(10)),
+                              child: Text(_positionChipLabel,
                                   style: TextStyle(
                                       fontSize: 11,
-                                      color: isDark
-                                          ? AppColors.darkTextTertiary
-                                          : Colors.grey[500]),
-                                  maxLines: 1,
-                                  overflow: TextOverflow.ellipsis)),
-                          // Tap the page number (or percentage) to jump.
-                          GestureDetector(
-                            onTap: _showGoToDialog,
-                            behavior: HitTestBehavior.opaque,
-                            child: Container(
-                                padding: const EdgeInsets.symmetric(
-                                    horizontal: 10, vertical: 4),
-                                decoration: BoxDecoration(
-                                    color: _readerAccent.withValues(alpha: 0.1),
-                                    borderRadius: BorderRadius.circular(10)),
-                                child: Text(_positionChipLabel,
-                                    style: TextStyle(
-                                        fontSize: 11,
-                                        fontWeight: FontWeight.w600,
-                                        color: _readerAccent))),
-                          ),
-                        ]),
-                      ),
+                                      fontWeight: FontWeight.w600,
+                                      color: _readerAccent))),
+                        ),
+                      ]),
                     ),
-                    Visibility(
-                      visible: _isEpubReady,
-                      maintainSize: true,
-                      maintainAnimation: true,
-                      maintainState: true,
-                      child: LinearProgressIndicator(
-                          value: _readProgress,
-                          backgroundColor: Colors.transparent,
-                          color: _readerAccent,
-                          minHeight: 2),
-                    ),
-                  ])
-                // Hidden (immersive, as in Apple Books): just the book title
-                // under the status bar.
-                : _immersiveBar(
-                    top: true,
-                    text: widget.title,
-                    inset: steadyMedia.padding.top,
-                    isDark: isDark),
+                  ),
+                  Visibility(
+                    visible: _isEpubReady,
+                    maintainSize: true,
+                    maintainAnimation: true,
+                    maintainState: true,
+                    child: LinearProgressIndicator(
+                        value: _readProgress,
+                        backgroundColor: Colors.transparent,
+                        color: _readerAccent,
+                        minHeight: 2),
+                  ),
+                ])),
             // The reading area is the page colour from the first frame
             // (download, loading), so the page never shows another colour.
             Expanded(
@@ -2263,25 +2262,56 @@ class _EpubViewerScreenState extends State<EpubViewerScreen>
                         : _isLoading
                             ? _buildLoading(isTablet)
                             : _buildEpubViewer(isDark, pageColor))),
-            _chromeVisible
-                // Reserved (invisible, not tappable) until the book is ready.
-                ? Visibility(
-                    visible: _isEpubReady,
-                    maintainSize: true,
-                    maintainAnimation: true,
-                    maintainState: true,
-                    child: _buildBottomActionBar(isDark, isTablet),
-                  )
+            _chromeBand(
+                pageColor: pageColor,
                 // Hidden: where you are in the chapter.
-                : _immersiveBar(
+                immersive: _immersiveBar(
                     top: false,
                     text: !_isEpubReady ? '' : _immersivePositionText,
                     inset: steadyMedia.padding.bottom,
                     isDark: isDark),
+                // Reserved (invisible, not tappable) until the book is ready.
+                chrome: Visibility(
+                  visible: _isEpubReady,
+                  maintainSize: true,
+                  maintainAnimation: true,
+                  maintainState: true,
+                  child: _buildBottomActionBar(isDark, isTablet),
+                )),
           ]),
         ),
       ),
     );
+  }
+
+  /// Shows or hides the reader controls. The book keeps its size either
+  /// way (see build), so the text never moves.
+  void _toggleChrome() {
+    if (_chromeVisible) FocusManager.instance.primaryFocus?.unfocus();
+    setState(() => _chromeVisible = !_chromeVisible);
+  }
+
+  /// A band of reader controls ([chrome]) that keeps its space while the
+  /// controls are hidden: [immersive] (title or position) is shown in its
+  /// place on the page colour. Changing the band's size would make the book
+  /// re-lay out its pages, reflowing the text to another page (a visible
+  /// jump at every tap on the page).
+  Widget _chromeBand({
+    required Widget chrome,
+    required Widget immersive,
+    required Color pageColor,
+  }) {
+    return Stack(children: [
+      Visibility(
+        visible: _chromeVisible,
+        maintainSize: true,
+        maintainAnimation: true,
+        maintainState: true,
+        child: chrome,
+      ),
+      if (!_chromeVisible)
+        Positioned.fill(child: ColoredBox(color: pageColor, child: immersive)),
+    ]);
   }
 
   /// Title / position line shown while the reader controls are hidden.
@@ -2291,7 +2321,6 @@ class _EpubViewerScreenState extends State<EpubViewerScreen>
     required double inset,
     required bool isDark,
   }) {
-    const height = 26.0;
     final label = Text(text,
         maxLines: 1,
         overflow: TextOverflow.ellipsis,
@@ -2301,9 +2330,7 @@ class _EpubViewerScreenState extends State<EpubViewerScreen>
             fontWeight: FontWeight.w500,
             letterSpacing: 0.2,
             color: isDark ? AppColors.darkTextTertiary : Colors.grey[500]));
-    return SizedBox(
-      width: double.infinity,
-      height: inset + height,
+    return SizedBox.expand(
       child: Padding(
         padding: EdgeInsets.only(
             top: top ? inset : 0, bottom: top ? 0 : inset, left: 48, right: 48),
@@ -2470,10 +2497,8 @@ class _EpubViewerScreenState extends State<EpubViewerScreen>
       unawaited(_turnPage(forward: x > 0.5));
       return;
     }
-    setState(() {
-      _menu = null;
-      _chromeVisible = !_chromeVisible;
-    });
+    setState(() => _menu = null);
+    _toggleChrome();
   }
 
   /// A table or figure, enlarged on its own (pinch to zoom, scroll), as in
