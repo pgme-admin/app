@@ -166,7 +166,8 @@ class EpubReaderBridge {
     EpubController controller, {
     required bool dark,
     required void Function(bool forward) onTurnRequest,
-    VoidCallback? onPagesReady,
+    void Function(String? key, int size, bool measured, String? counts)?
+        onPagesReady,
   }) async {
     final webView = controller.webViewController;
     if (webView == null) return false;
@@ -179,7 +180,21 @@ class EpubReaderBridge {
     );
     webView.addJavaScriptHandler(
       handlerName: 'pgmePagesReady',
-      callback: (_) => onPagesReady?.call(),
+      callback: (args) {
+        final data = args.isNotEmpty ? args.first : null;
+        if (data is Map) {
+          final counts = data['counts'];
+          onPagesReady?.call(
+              data['key'] as String?,
+              (data['size'] as num?)?.toInt() ?? 0,
+              data['final'] == true,
+              counts is List && data['sig'] is String
+                  ? jsonEncode({'sig': data['sig'], 'counts': counts})
+                  : null);
+        } else {
+          onPagesReady?.call(null, 0, false, null);
+        }
+      },
     );
     final result = await webView.evaluateJavascript(source: _script);
     await setDark(controller, dark);
@@ -292,9 +307,33 @@ class EpubReaderBridge {
 
   /// Starts (re)building the book's page numbers for the current page size
   /// when needed; [install]'s onPagesReady fires when they are ready.
-  static Future<void> paginate(EpubController controller, String layoutKey) {
+  /// [knownSize]: the page size measured for this layout in an earlier
+  /// session, so the numbers are the same every time the book is opened.
+  /// [savedCounts]: the exact page counts saved for this layout (the JSON
+  /// given to onPagesReady), reused when the book is the same.
+  static Future<void> paginate(EpubController controller, String layoutKey,
+      {int knownSize = 0,
+      String? savedCounts,
+      required double width,
+      required double height,
+      bool spread = false}) {
+    var saved = 'null';
+    if (savedCounts != null) {
+      try {
+        // Re-encoded so only well-formed JSON reaches the page.
+        saved = jsonEncode(jsonDecode(savedCounts));
+      } catch (_) {}
+    }
     return _call(controller,
-        'window.pgme && window.pgme.paginate(${jsonEncode(layoutKey)})');
+        'window.pgme && window.pgme.paginate(${jsonEncode(layoutKey)}, $knownSize, ${width.floor()}, ${height.floor()}, $spread, $saved)');
+  }
+
+  /// Shows page [page] (exact screen page when the book's pages have been
+  /// counted). False when the book has no such page.
+  static Future<bool> goToPage(EpubController controller, int page) async {
+    final r = await _eval(
+        controller, 'window.pgme ? window.pgme.goToPage($page) : false');
+    return r == true;
   }
 
   static Future<EpubPageInfo?> pageInfo(EpubController controller) async {
@@ -778,11 +817,31 @@ class EpubReaderBridge {
       return !!(pl && pl.pages && pl.pages.length > 1 && isFinite(pl.lastPage));
     } catch (e) { return false; }
   }
+  // The book's location index is complete. epub.js fills it chapter by
+  // chapter and sets its total only at the end; until then a replacement
+  // index would have the rest of the first one appended to it (page totals
+  // that keep growing, wrong progress).
+  function locationsReady() {
+    try {
+      var loc = book.locations, L = loc && loc._locations, q = loc && loc.q;
+      if (!L || !L.length || loc.total !== L.length - 1) return false;
+      // Still processing chapters (a one-location first chapter also has
+      // total === length - 1).
+      return !(q && (q.running || (q._q && q._q.length)));
+    } catch (e) { return false; }
+  }
   function pageMode() {
     if (printPages()) return 'print';
     if (fixedLayout()) return 'fixed';
-    // Text pages only once they match the screen (see paginate).
-    try { if (pgme.pageSize && book.locations && book.locations.length() > 0) return 'locations'; } catch (e) {}
+    // Exact screen pages once every chapter has been counted (see
+    // paginate); until then, text pages sized like a screen page.
+    if (pgme.screen) return 'screen';
+    // Being counted: the exact numbers follow (no stand-in numbers that
+    // would change a moment later).
+    if (pgme.counting) return null;
+    // Only when the chapters could not be counted: text pages sized like
+    // a screen page.
+    if (pgme.pageSize && locationsReady()) return 'locations';
     return null;
   }
   // Page numbers for a reflowable book: epub.js locations sized to what one
@@ -791,24 +850,240 @@ class EpubReaderBridge {
   // rebuilt when the font, spacing or screen change the page size.
   pgme.pageSize = 0;
   pgme.pageKey = null;
+  // True once the page size was measured on laid-out text (or is the size
+  // measured in an earlier session for this layout); false for a stand-in.
+  pgme.pageFinal = false;
   pgme.paginating = false;
-  // `key` names the layout (font, size, spacing, screen). Pages are measured
-  // once per layout, so the numbers stay put while reading.
-  pgme.paginate = function (key) {
-    if (printPages() || fixedLayout() || pgme.paginating) return false;
-    if (key && key === pgme.pageKey) return false;
-    var loc = rendition.location;
-    if (!loc || !loc.start || !loc.start.displayed) return false;
-    var total = loc.start.displayed.total;
-    if (!(total >= 3)) return false;
-    var c = contentsFor(loc.start.cfi);
-    if (!c || !c.document || !c.document.body) return false;
-    var chars = (c.document.body.textContent || '').replace(/\s+/g, ' ').length;
-    var size = Math.max(300, Math.round(chars / total));
-    // The book makes its own first index; wait for it.
-    if (!book.locations || book.locations.length() === 0) return false;
-    pgme.pageKey = key || null;
-    if (pgme.pageSize && Math.abs(size - pgme.pageSize) / pgme.pageSize < 0.08) return false;
+  pgme.counting = false;
+  pgme.requestKey = null;
+  var measureTries = {};
+  // Characters as epub.js counts them for its locations: text nodes that
+  // are not only whitespace, at their full length.
+  function locLength(doc) {
+    var n = 0;
+    if (!doc || !doc.body) return 0;
+    var w = doc.createTreeWalker(doc.body, 4 /* SHOW_TEXT */, null);
+    for (var t = w.nextNode(); t; t = w.nextNode()) {
+      if (t.textContent.trim().length) n += t.length;
+    }
+    return n;
+  }
+  function sizeFrom(chars, pages) {
+    return pages >= 3 && chars > 0 ? Math.max(200, Math.round(chars / pages)) : 0;
+  }
+  // The book's longest chapter (the most locations): its main text, the
+  // fairest sample of what a page holds. A contents list or a title page
+  // holds far less per page and would number the book too high.
+  function longestSection() {
+    var L = (book.locations && book.locations._locations) || [];
+    var counts = {}, best = -1, bestN = 0;
+    for (var i = 0; i < L.length; i++) {
+      var s;
+      try { s = new ePub.CFI(L[i]).spinePos; } catch (e) { continue; }
+      var n = counts[s] = (counts[s] || 0) + 1;
+      if (n > bestN) { bestN = n; best = s; }
+    }
+    return best >= 0 ? book.spine.get(best) : null;
+  }
+  // An off-screen copy of the reader at the page size (w x h): the same
+  // book, styles, text size and spread, laid out where it cannot be seen.
+  // work(r, finish) uses it; finish(result) removes it and calls done.
+  function withOffscreen(w, h, spread, work, done, limitMs) {
+    if (!(w > 0) || !(h > 0)) { done(null); return; }
+    var hooks = book.spine.hooks;
+    var kept = { content: hooks.content.hooks.slice(), serialize: hooks.serialize.hooks.slice() };
+    var host = document.createElement('div');
+    host.setAttribute('aria-hidden', 'true');
+    host.style.cssText = 'position:fixed;left:-30000px;top:0;width:' + w + 'px;height:' + h +
+      'px;overflow:hidden;visibility:hidden;pointer-events:none;';
+    document.body.appendChild(host);
+    var r = null, over = false;
+    var timer = setTimeout(function () { finish(null); }, limitMs);
+    function finish(result) {
+      if (over) return;
+      over = true;
+      clearTimeout(timer);
+      try { if (r) r.destroy(); } catch (e) {}
+      try { host.remove(); } catch (e) {}
+      // The copy registered hooks on the shared book; drop them.
+      hooks.content.hooks = hooks.content.hooks.filter(function (f) { return kept.content.indexOf(f) >= 0; });
+      hooks.serialize.hooks = hooks.serialize.hooks.filter(function (f) { return kept.serialize.indexOf(f) >= 0; });
+      done(result);
+    }
+    try {
+      r = book.renderTo(host, { width: w, height: h, flow: 'paginated', manager: 'default',
+        spread: spread ? 'auto' : 'none', allowScriptedContent: false });
+      var src = rendition.themes, dst = r.themes;
+      Object.keys(src._themes || {}).forEach(function (name) {
+        var t = src._themes[name];
+        dst._themes[name] = { rules: t.rules, url: t.url, serialized: t.serialized };
+      });
+      dst._current = src._current;
+      Object.keys(src._overrides || {}).forEach(function (o) {
+        dst._overrides[o] = { value: src._overrides[o].value, priority: src._overrides[o].priority };
+      });
+      work(r, finish, function () { return over; });
+    } catch (e) { finish(null); }
+  }
+  // Resolves once the displayed chapter has its fonts and images (which
+  // change how much fits on a page) and has been laid out again.
+  function settled(r) {
+    return new Promise(function (resolve) {
+      var waits = [];
+      try {
+        var v = r.manager.views.first();
+        var doc = v && v.contents && v.contents.document;
+        if (doc && doc.fonts && doc.fonts.ready) waits.push(doc.fonts.ready);
+        Array.prototype.forEach.call((doc && doc.images) || [], function (img) {
+          if (img.complete) return;
+          waits.push(new Promise(function (res) {
+            img.addEventListener('load', res, { once: true });
+            img.addEventListener('error', res, { once: true });
+          }));
+        });
+      } catch (e) {}
+      var gone = false;
+      var cap = setTimeout(go, 1500);
+      function go() {
+        if (gone) return;
+        gone = true;
+        clearTimeout(cap);
+        requestAnimationFrame(function () {
+          requestAnimationFrame(function () { setTimeout(resolve, 30); });
+        });
+      }
+      Promise.all(waits).then(go, go);
+    });
+  }
+  function shownPages(r) {
+    var v = r.manager.views.first();
+    return v ? r.manager.layout.count(v.width()).pages : 0;
+  }
+  // Characters per page on this screen, from the longest chapter laid out
+  // off screen. done(size), or done(0) if it cannot tell.
+  function measureOffscreen(w, h, spread, done) {
+    var section = longestSection();
+    if (!section) { done(0); return; }
+    withOffscreen(w, h, spread, function (r, finish) {
+      r.display(section.href).then(function () { return settled(r); }).then(function () {
+        var v = r.manager.views.first();
+        finish(sizeFrom(locLength(v.contents.document), shownPages(r)));
+      }).catch(function (e) {
+        console.warn('pgme: page size not measured', e);
+        finish(0);
+      });
+    }, function (size) { done(size || 0); }, 10000);
+  }
+  // Exact screen pages: every chapter laid out off screen, as the reader
+  // shows it, and its pages counted (like Apple Books). done(counts) with
+  // one count per spine item (0 for items the reader skips), or null.
+  function countChapters(w, h, spread, done) {
+    var items = (book.spine && book.spine.spineItems) || [];
+    if (!items.length) { done(null); return; }
+    withOffscreen(w, h, spread, function (r, finish, isOver) {
+      var counts = [], i = 0;
+      function step() {
+        if (isOver()) return;
+        if (i >= items.length) { finish(counts); return; }
+        var sec = items[i];
+        if (!sec.linear) { counts[i] = 0; i++; setTimeout(step, 0); return; }
+        r.display(sec.href).then(function () { return settled(r); }).then(function () {
+          counts[i] = Math.max(1, shownPages(r) || 1);
+        }, function () { counts[i] = 1; }).then(function () {
+          i++;
+          setTimeout(step, 0);
+        });
+      }
+      step();
+    }, done, 300000);
+  }
+  // Identifies the book's structure, so saved counts are only reused for
+  // the same book.
+  function bookSig() {
+    var h = 0x811c9dc5, items = (book.spine && book.spine.spineItems) || [];
+    var meta = (book.packaging && book.packaging.metadata) || {};
+    var text = (meta.identifier || '') + '|' + (meta.modified_date || '') + '|' +
+      items.map(function (it) { return it.href + (it.linear ? '' : '*'); }).join('|');
+    for (var i = 0; i < text.length; i++) {
+      h ^= text.charCodeAt(i);
+      h = Math.imul(h, 0x01000193) >>> 0;
+    }
+    return items.length + '-' + h.toString(16);
+  }
+  pgme.screen = null;
+  function useCounts(key, counts) {
+    var items = (book.spine && book.spine.spineItems) || [];
+    if (!counts || counts.length !== items.length) return false;
+    var offsets = [], total = 0;
+    for (var i = 0; i < counts.length; i++) {
+      var n = counts[i];
+      if (typeof n !== 'number' || !(n >= 0)) return false;
+      offsets.push(total);
+      total += n;
+    }
+    if (total < 1) return false;
+    pgme.screen = { key: key, counts: counts.slice(), offsets: offsets, total: total };
+    return true;
+  }
+  function screenReady(key) {
+    var sc = pgme.screen;
+    call('pgmePagesReady', { key: key, size: pgme.pageSize, final: pgme.pageFinal,
+      counts: sc ? sc.counts : null, sig: bookSig() });
+  }
+  // Stand-ins when the off-screen count fails: a laid-out chapter on screen
+  // with 3+ pages, else an estimate from the text metrics.
+  function measuredPageSize() {
+    var m = rendition.manager;
+    if (!m || !m.layout || rendition.settings.flow === 'scrolled') return 0;
+    var best = null;
+    rendition.views().forEach(function (v) {
+      try {
+        var doc = v.contents && v.contents.document;
+        if (!doc || !doc.body) return;
+        var chars = locLength(doc), pages = m.layout.count(v.width()).pages;
+        if (pages >= 3 && (!best || chars > best.chars)) best = { pages: pages, chars: chars };
+      } catch (e) {}
+    });
+    return best ? sizeFrom(best.chars, best.pages) : 0;
+  }
+  var SAMPLE = 'The patient was examined and the findings were recorded in detail, ' +
+    'including history, signs, and investigations.';
+  function estimatedPageSize() {
+    try {
+      var c = rendition.getContents()[0];
+      var doc = c && c.document;
+      if (!doc || !doc.body) return 0;
+      var el = doc.querySelector('p') || doc.body;
+      var cs = doc.defaultView.getComputedStyle(el);
+      var fs = parseFloat(cs.fontSize) || 16;
+      var lh = parseFloat(cs.lineHeight);
+      if (!(lh > 0)) lh = fs * 1.4;
+      var ctx = document.createElement('canvas').getContext('2d');
+      ctx.font = cs.fontStyle + ' ' + cs.fontWeight + ' ' + fs + 'px ' + cs.fontFamily;
+      var cw = ctx.measureText(SAMPLE).width / SAMPLE.length;
+      if (!(cw > 0)) cw = fs * 0.5;
+      var m = rendition.manager, lay = m && m.layout;
+      var paged = rendition.settings.flow !== 'scrolled' && lay && lay.columnWidth;
+      var bs = doc.defaultView.getComputedStyle(doc.body);
+      var colW = paged ? lay.columnWidth :
+        doc.body.clientWidth - (parseFloat(bs.paddingLeft) || 0) - (parseFloat(bs.paddingRight) || 0);
+      var pageH = (paged ? lay.height : window.innerHeight) - 40;
+      var lines = Math.max(1, Math.floor(pageH / lh));
+      var perLine = Math.max(10, colW / cw);
+      return Math.max(200, Math.round(lines * perLine * 0.7));
+    } catch (e) { return 0; }
+  }
+  // Counts the book's pages for `size` characters per page, swapping the
+  // new numbers in at once when they are ready.
+  function build(key, size, final) {
+    // Close enough to the numbers shown: keep them (no renumbering).
+    if (pgme.pageSize && Math.abs(size - pgme.pageSize) / pgme.pageSize < 0.08) {
+      pgme.pageKey = key;
+      pgme.pageFinal = pgme.pageFinal || final;
+      call('pgmePagesReady', { key: key, size: pgme.pageSize, final: pgme.pageFinal });
+      return;
+    }
+    pgme.pageKey = key;
     pgme.paginating = true;
     var Locations = book.locations.constructor;
     var fresh = new Locations(book.spine, book.load.bind(book), 20);
@@ -817,11 +1092,111 @@ class EpubReaderBridge {
       book.locations.total = fresh.total;
       book.locations.break = size;
       pgme.pageSize = size;
+      pgme.pageFinal = final;
       pgme.paginating = false;
-      call('pgmePagesReady', true);
-    }, function () { pgme.paginating = false; });
-    return true;
+      call('pgmePagesReady', { key: key, size: size, final: final });
+    }, function () { pgme.paginating = false; pgme.pageKey = null; });
+  }
+  // `key` names the layout (font, size, spacing, spread, screen); pages are
+  // counted once per layout, so the numbers stay put while reading. `known`
+  // is the size counted for this layout in an earlier session (or 0); w, h
+  // and spread describe the page (as in page mode, also when scrolling).
+  pgme.paginate = function (key, known, w, h, spread, saved) {
+    if (printPages() || fixedLayout()) return false;
+    key = key || null;
+    pgme.requestKey = key;
+    // Exact pages counted in an earlier session for this layout and book
+    // (shown at once, before anything else is ready).
+    if (saved && saved.sig === bookSig() && (!pgme.screen || pgme.screen.key !== key)) {
+      useCounts(key, saved.counts);
+    }
+    // A different layout: the old exact pages no longer match the screen.
+    if (pgme.screen && pgme.screen.key !== key) pgme.screen = null;
+    if (pgme.paginating || pgme.counting) return false;
+    // 1. Exact screen pages, counted once per layout. Needs no index, so
+    //    it starts at once.
+    if (!pgme.screen && !(countTries[key] >= 2)) {
+      countTries[key] = (countTries[key] || 0) + 1;
+      pgme.counting = true;
+      countChapters(w, h, spread, function (counts) {
+        pgme.counting = false;
+        // Still the layout on screen: use it. Otherwise (or if it failed)
+        // the reader asks again with its current layout.
+        if (key === pgme.requestKey && useCounts(key, counts)) screenReady(key);
+        else call('pgmePagesReady', { key: null, size: 0, final: false });
+      });
+      return true;
+    }
+    if (pgme.screen) return false;
+    // 2. Fallback when the chapters cannot be counted: text pages sized
+    //    like a screen page, once the book's own index is complete.
+    if (!locationsReady()) return false;
+    if (key !== pgme.pageKey || (!pgme.pageFinal && (measureTries[key] || 0) < 2)) {
+      if (known > 0) { build(key, known, true); return true; }
+      measureTries[key] = (measureTries[key] || 0) + 1;
+      pgme.paginating = true;
+      measureOffscreen(w, h, spread, function (size) {
+        pgme.paginating = false;
+        var final = size > 0;
+        if (!final) size = measuredPageSize() || estimatedPageSize();
+        if (!size || (!final && key === pgme.pageKey)) return;
+        build(key, size, final);
+      });
+      return true;
+    }
+    return false;
   };
+  var countTries = {};
+  // Within-chapter page of a location: exact when its chapter is laid out
+  // on screen, otherwise from its place in the chapter's text.
+  var startsCache = { list: null, bySection: null };
+  function sectionStarts(idx) {
+    var L = book.locations._locations || [];
+    if (startsCache.list !== L) {
+      var by = {};
+      for (var i = 0; i < L.length; i++) {
+        var s;
+        try { s = new ePub.CFI(L[i]).spinePos; } catch (e) { continue; }
+        (by[s] = by[s] || []).push(L[i]);
+      }
+      startsCache = { list: L, bySection: by };
+    }
+    return startsCache.bySection[idx] || [];
+  }
+  function screenColumnOf(cfi) {
+    try {
+      var m = rendition.manager;
+      if (!m || !m.layout || rendition.settings.flow === 'scrolled') return null;
+      var c = contentsFor(cfi);
+      if (!c) return null;
+      var range = c.range(cfi);
+      var rects = range ? textRects(range) : [];
+      var r = rects.length ? rects[0] : (range ? range.getBoundingClientRect() : null);
+      var pw = m.layout.pageWidth || m.layout.width;
+      if (!r || !pw) return null;
+      return Math.floor(Math.max(0, r.left) / pw) + 1;
+    } catch (e) { return null; }
+  }
+  function pageInChapter(cfi, idx) {
+    var n = pgme.screen.counts[idx] || 0;
+    if (n <= 1) return 1;
+    var col = screenColumnOf(cfi);
+    if (col) return Math.min(n, col);
+    var starts = sectionStarts(idx), cmp = new ePub.CFI(), before = 0;
+    if (!starts.length) return 1;
+    for (var i = 0; i < starts.length; i++) {
+      try { if (cmp.compare(starts[i], cfi) <= 0) before++; } catch (e) {}
+    }
+    var frac = Math.max(0, before - 1) / starts.length;
+    return Math.min(n, Math.max(1, Math.floor(frac * n) + 1));
+  }
+  function screenPageAt(cfi) {
+    var idx;
+    try { idx = new ePub.CFI(cfi).spinePos; } catch (e) { return null; }
+    var sc = pgme.screen;
+    if (!sc || !(idx >= 0) || idx >= sc.counts.length) return null;
+    return Math.max(1, sc.offsets[idx] + pageInChapter(cfi, idx));
+  }
   // Text pages: page N starts at location N-1, so a position's page is the
   // number of page starts at or before it.
   function startsUpTo(cfi) {
@@ -840,6 +1215,7 @@ class EpubReaderBridge {
       if (mode === 'print') { var p = book.pageList.pageFromCfi(cfi); return p > 0 ? p : null; }
       if (mode === 'fixed') { var s = new ePub.CFI(cfi).spinePos; return s >= 0 ? s + 1 : null; }
       if (mode === 'locations') return startsUpTo(cfi);
+      if (mode === 'screen') return screenPageAt(cfi);
     } catch (e) {}
     return null;
   }
@@ -870,6 +1246,7 @@ class EpubReaderBridge {
       if (mode === 'print') return book.pageList.lastPage;
       if (mode === 'fixed') return book.spine.length || book.spine.spineItems.length;
       if (mode === 'locations') return book.locations.length();
+      if (mode === 'screen') return pgme.screen.total;
     } catch (e) {}
     return 0;
   }
@@ -877,6 +1254,25 @@ class EpubReaderBridge {
     var loc = rendition.location;
     var mode = pageMode();
     if (!loc || !loc.start || !mode) return null;
+    if (mode === 'screen') {
+      var sc = pgme.screen, paged = rendition.settings.flow !== 'scrolled';
+      var end = paged && loc.end && loc.end.displayed ? loc.end : loc.start;
+      var idx = end.index;
+      if (!(idx >= 0) || idx >= sc.counts.length) return null;
+      // The reader's own count for the chapter on screen is the truth; a
+      // chapter laid out differently (late font or image) is corrected.
+      if (paged && loc.start.index === idx && loc.start.displayed &&
+          loc.start.displayed.total >= 1 && loc.start.displayed.total !== sc.counts[idx]) {
+        var fixed = sc.counts.slice();
+        fixed[idx] = loc.start.displayed.total;
+        useCounts(sc.key, fixed);
+        sc = pgme.screen;
+        setTimeout(function () { screenReady(sc.key); }, 0);
+      }
+      var within = paged ? end.displayed.page : pageInChapter(loc.start.cfi, idx);
+      var current = sc.offsets[idx] + Math.min(Math.max(1, within), Math.max(1, sc.counts[idx]));
+      return JSON.stringify({ mode: mode, current: Math.min(current, sc.total), total: sc.total });
+    }
     // A screen holds about one page start: count up to the screen's end,
     // so "go to page N" shows N.
     var at = mode === 'locations' && loc.end && loc.end.cfi ? loc.end.cfi : loc.start.cfi;
@@ -890,6 +1286,59 @@ class EpubReaderBridge {
       if (mode === 'locations') { var l = book.locations.cfiFromLocation(n - 1); return typeof l === 'string' ? l : null; }
     } catch (e) {}
     return null;
+  };
+  // Shows page n. Exact screen pages: opens the chapter near the page,
+  // then steps to the exact page.
+  pgme.goToPage = function (n) {
+    if (pageMode() !== 'screen') {
+      var t = pgme.targetForPage(n);
+      return t ? pgme.goTo(t, false) : false;
+    }
+    var sc = pgme.screen, idx = -1;
+    for (var i = 0; i < sc.counts.length; i++) {
+      if (sc.counts[i] > 0 && n > sc.offsets[i] && n <= sc.offsets[i] + sc.counts[i]) { idx = i; break; }
+    }
+    var sec = idx >= 0 ? book.spine.get(idx) : null;
+    if (!sec) return false;
+    var within = n - sc.offsets[idx], target = sec.href;
+    if (within > 1) {
+      var starts = sectionStarts(idx);
+      if (starts.length) {
+        target = starts[Math.min(starts.length - 1,
+          Math.floor((within - 1) / sc.counts[idx] * starts.length))];
+      }
+    }
+    if (!pgme.hasSelection()) clearSelectionFlags();
+    // Each move is judged on the location it produced: epub.js reports a
+    // new location a moment after a jump or turn resolves.
+    function whenRelocated(fn) {
+      var fired = false;
+      function go() {
+        if (fired) return;
+        fired = true;
+        rendition.off('relocated', go);
+        setTimeout(fn, 0);
+      }
+      rendition.on('relocated', go);
+      setTimeout(go, 900);
+    }
+    function settle(left) {
+      var loc = rendition.location;
+      if (!loc || !loc.start || left <= 0 || rendition.settings.flow === 'scrolled') return;
+      var first, last;
+      if (loc.start.index === idx) first = loc.start.displayed.page;
+      else first = loc.start.index < idx ? 0 : Infinity;
+      if (loc.end && loc.end.index === idx) last = loc.end.displayed.page;
+      else last = loc.end && loc.end.index > idx ? Infinity : first;
+      if (within >= first && within <= last) return;
+      whenRelocated(function () { settle(left - 1); });
+      pgme.directTurn = true;
+      try { if (within > last) rendition.next(); else rendition.prev(); }
+      finally { pgme.directTurn = false; }
+    }
+    whenRelocated(function () { settle(12); });
+    try { rendition.display(target); } catch (e) { return false; }
+    return true;
   };
 
   // Which of `cfis` lie on the visible page (bookmarks survive font changes).

@@ -37,6 +37,27 @@ bool readingThemeIsDark(EpubReadingTheme theme, bool appIsDark) =>
     theme == EpubReadingTheme.dark ||
     (theme == EpubReadingTheme.followApp && appIsDark);
 
+/// The colour of the reading page. The book page itself is transparent, so
+/// this is the colour seen behind the text; everything drawn in its place
+/// (page-turn stills, the curl, the loading cover) must use exactly this
+/// colour, or the page blinks to another colour (white on Warm) mid-turn.
+Color epubPageColor(EpubReadingTheme theme, bool appIsDark) {
+  if (readingThemeIsDark(theme, appIsDark)) return const Color(0xFF121212);
+  if (theme == EpubReadingTheme.warm) return const Color(0xFFF7F0E3);
+  return Colors.white;
+}
+
+/// The reader's screen insets with any keyboard left out. Flutter drops the
+/// bottom safe-area padding while a keyboard shows; the reader lays out with
+/// the screen's own insets instead, so a keyboard (note editor, search, go
+/// to page) never changes the size of the book, which would re-lay out the
+/// book and move it to another page.
+MediaQueryData readerMediaWithoutKeyboard(MediaQueryData media) =>
+    media.copyWith(
+      viewInsets: EdgeInsets.zero,
+      padding: media.padding.copyWith(bottom: media.viewPadding.bottom),
+    );
+
 /// Keep the publisher's typography unless the reader chooses a font.
 EpubTheme epubReadingTheme(
   EpubReadingTheme theme,
@@ -47,11 +68,7 @@ EpubTheme epubReadingTheme(
 }) {
   final dark = readingThemeIsDark(theme, appIsDark);
   final warm = theme == EpubReadingTheme.warm;
-  final background = dark
-      ? const Color(0xFF121212)
-      : warm
-          ? const Color(0xFFF7F0E3)
-          : Colors.white;
+  final background = epubPageColor(theme, appIsDark);
   final foreground = dark
       ? const Color(0xFFF1F1F1)
       : warm
